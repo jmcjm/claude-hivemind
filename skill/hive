@@ -268,6 +268,9 @@ EOF
 Nie wysylam — Enter wyslalby TO, nie moje zadanie. Ogarnij prompt (hive clear $name) i powtorz."
 
   local msg="Przeczytaj $dir/brief.md i wykonaj zadanie zgodnie z nim."
+  # 'done' = poprzednia tura skonczona, pole wejsciowe znow gotowe. Zapamietujemy stan
+  # sprzed wysylki, zeby stare 'done' nie udawalo dostarczenia nowego zadania.
+  local pre; pre=$(pane_status "$pane")
   local attempt i st
   for attempt in 1 2 3; do
     herdr agent send "$name" "$msg" >/dev/null 2>&1 || die "nie udalo sie wyslac zadania do $name"
@@ -277,6 +280,10 @@ Nie wysylam — Enter wyslalby TO, nie moje zadanie. Ogarnij prompt (hive clear 
       sleep 2
       st=$(pane_status "$pane")
       [ "$st" = working ] && { echo "task: $name <- $dir/brief.md (proba $attempt)"; return 0; }
+      # Szybki dron konczy cala robote miedzy odpytaniami: report.md (kasowany przed
+      # wysylka) jest twardym dowodem dostarczenia; 'done' liczy sie tylko jesli swieze.
+      [ -f "$dir/report.md" ] && { echo "task: $name <- $dir/brief.md (proba $attempt, fast finish)"; return 0; }
+      [ "$st" = done ] && [ "$pre" != done ] && { echo "task: $name <- $dir/brief.md (proba $attempt)"; return 0; }
       [ "$st" = dead ] && die "dron $name nie zyje"
     done
   done
