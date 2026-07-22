@@ -14,6 +14,11 @@ HIVE_DIR="${HIVE_DIR:-$HOME/.herdr-hive}"
 HIVE_BIN="$HOME/.claude/skills/hivemind/hive"
 [ -x "$HIVE_BIN" ] || exit 0
 
+# Dron konwersacyjny (czlowiek siedzi w jego panelu) konczy ture po KAZDEJ wypowiedzi,
+# wiec automatyczne pobudki sa czystym szumem dla koordynatora. Marker je wycisza;
+# jawne 'hive send coord' z wnetrza drona dziala dalej.
+[ -f "$HIVE_DIR/drones/$HIVE_DRONE/.mute" ] && exit 0
+
 payload=$(cat 2>/dev/null || true)          # JSON hooka na stdin (Notification ma .message)
 
 # Status z raportu drona, jesli zdazyl go zapisac

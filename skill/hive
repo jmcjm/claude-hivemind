@@ -454,6 +454,19 @@ cmd_peek() {  # peek <nazwa> [linie] — podglad terminala drona
     || die "nie udalo sie odczytac panelu"
 }
 
+cmd_mute() {  # mute <nazwa> [--off] — wycisza automatyczne pobudki drona
+  local name="${1:?uzycie: hive mute <nazwa> [--off]}"
+  local dir; dir=$(drone_dir "$name")
+  [ -d "$dir" ] || die "nieznany dron: $name"
+  if [ "${2:-}" = "--off" ]; then
+    rm -f "$dir/.mute"; echo "mute: $name — pobudki znow wlaczone"
+  else
+    : > "$dir/.mute"
+    echo "mute: $name — hooki Stop/Notification wyciszone (uzyj przy dronie konwersacyjnym,"
+    echo "      z ktorym czlowiek rozmawia sam; 'hive send coord' z drona dziala dalej)"
+  fi
+}
+
 cmd_kill() {  # kill <nazwa> [--purge]
   local name="${1:?uzycie: hive kill <nazwa> [--purge]}"; local purge="${2:-}"
   local ws; ws=$(meta_get "$name" workspace_id) || die "nieznany dron: $name"
@@ -500,6 +513,7 @@ case "${1:-}" in
   status) shift; cmd_status "$@" ;;
   wait)   shift; cmd_wait   "$@" ;;
   report) shift; cmd_report "$@" ;;
+  mute)   shift; cmd_mute   "$@" ;;
   peek)   shift; cmd_peek   "$@" ;;
   kill)   shift; cmd_kill   "$@" ;;
   rename) shift; cmd_rename "$@" ;;
@@ -517,6 +531,7 @@ hive — sterowanie rojem agentow Claude Code w herdr
   hive status [nazwa]                tabela stanu roju (nigdy nie blokuje)
   hive wait   [nazwy] [--timeout S]  czekaj na raporty, twardy limit (domyslnie 300s)
   hive report <nazwa>                pokaz raport drona
+  hive mute   <nazwa> [--off]        wycisz automatyczne pobudki (dron konwersacyjny)
   hive peek   <nazwa> [linie]        podglad terminala drona
   hive kill   <nazwa> [--purge]      ubij drona
   hive rename <stara> <nowa>         zmien nazwe drona i workspace
