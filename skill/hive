@@ -1,0 +1,521 @@
+#!/usr/bin/env bash
+# hive — sterowanie rojem agentów Claude Code w herdr.
+# Kazdy dron = jeden workspace herdr = jeden panel z interaktywnym Claude Code (opus).
+# Komunikacja: brief w pliku -> dron pracuje -> raport w pliku. Zero scrapowania TUI.
+set -uo pipefail
+
+SKILL_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+HIVE_DIR="${HIVE_DIR:-$HOME/.herdr-hive}"
+DRONES_DIR="$HIVE_DIR/drones"
+MAIL_DIR="$HIVE_DIR/mail"
+MODEL="${HIVE_MODEL:-opus}"
+mkdir -p "$DRONES_DIR" "$MAIL_DIR"
+
+die() { echo "hive: $*" >&2; exit 1; }
+command -v herdr >/dev/null || die "herdr nie znaleziony w PATH"
+
+# --- helpery --------------------------------------------------------------
+
+# Wyciaga pole z odpowiedzi JSON herdr. Uzycie: jqp '<sciezka python>' <<<"$json"
+jqp() { python3 -c "
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(1)
+r=d.get('result',d)
+$1" 2>/dev/null; }
+
+# Zwraca tekst wiszacy w polu wejsciowym drona (ostatnia linia z '>' w ramce), pusty gdy czysto.
+# KRYTYCZNE: prompt jest wspoldzielony z czlowiekiem. Jesli user cos tam wpisal i nie wyslal,
+# nasze 'enter' wyslaloby JEGO tekst, a nasz 'send' doklejlby sie do jego zdania.
+prompt_pending() {
+  local pane="$1"
+  herdr pane read "$pane" --source visible --lines 60 --format ansi 2>/dev/null | python3 -c "
+import re,sys
+# Claude Code podpowiada gotowe prompty jako ghost text renderowany na PRZYGASZONO (SGR 2).
+# To NIE jest tekst uzytkownika — Enter go nie wysyla. Realnie wpisany input jest jasny.
+# Bierzemy ostatnia linie promptu i zliczamy tylko znaki spoza fragmentow dim.
+SGR = re.compile(r'\x1b\[([0-9;]*)m')
+def bright_text(raw):
+    out, dim, pos = [], False, 0
+    for m in SGR.finditer(raw):
+        if not dim: out.append(raw[pos:m.start()])
+        for c in (m.group(1) or '0').split(';'):
+            if c == '2': dim = True
+            elif c in ('0', '22', ''): dim = False
+        pos = m.end()
+    if not dim: out.append(raw[pos:])
+    return ''.join(out)
+last = ''
+for raw in sys.stdin.read().splitlines():
+    if SGR.sub('', raw).strip().startswith('❯'):
+        last = bright_text(raw).strip().lstrip('❯').strip()
+print(last)
+" 2>/dev/null
+}
+
+# --- poczta roju ----------------------------------------------------------
+# Skrzynka = katalog na wiadomosc-plik. Bez demona, bez MTA: zapis jest atomowy (mv),
+# a odbiorca i tak nie odpytuje skrzynki — to wake_recipient go budzi.
+
+coord_pane() { cat "$HIVE_DIR/coord.pane" 2>/dev/null; }
+
+mailbox_put() {  # mailbox_put <od> <do> <kind> <temat> <tresc>
+  local from="$1" to="$2" kind="$3" subject="$4" body="$5"
+  local box="$MAIL_DIR/$to"; mkdir -p "$box"
+  local tmp; tmp=$(mktemp "$box/.tmp.XXXXXX") || return 1
+  python3 -c "
+import json,sys,time
+tmp,frm,to,kind,subject,body = sys.argv[1:7]
+json.dump({'ts':time.strftime('%Y-%m-%d %H:%M:%S'),'from':frm,'to':to,
+           'kind':kind,'subject':subject,'body':body},
+          open(tmp,'w'), ensure_ascii=False, indent=1)
+" "$tmp" "$from" "$to" "$kind" "$subject" "$body" || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$box/$(date +%s%N)-$from.json"
+}
+
+# Wybudza adresata wstrzykujac mu wiadomosc w prompt. Zabezpieczenia:
+#  - tylko gdy prompt adresata jest PUSTY (nie nadpisujemy tekstu czlowieka)
+#  - flock: dwa drony nie pisza naraz w jeden prompt
+#  - marker: jedna pobudka na partie, do czasu az adresat zrobi 'hive inbox'
+wake_recipient() {
+  local who="$1" pane=""
+  if [ "$who" = coord ]; then pane=$(coord_pane); else pane=$(pane_of "$who" 2>/dev/null); fi
+  [ -n "$pane" ] || return 0
+
+  exec 9>"$HIVE_DIR/.wake-lock"
+  flock -w 15 9 || return 0
+  [ -f "$HIVE_DIR/.wake-$who" ] && return 0        # juz obudzony, nie spamuj
+  [ "$(pane_status "$pane")" = dead ] && return 0
+  [ -n "$(prompt_pending "$pane")" ] && return 0   # czlowiek pisze — zostaw, poczta poczeka
+
+  herdr agent send "$pane" "HIVE-MAIL: nowa poczta. Odpal: hive inbox" >/dev/null 2>&1 || return 0
+  sleep 1
+  herdr pane send-keys "$pane" enter >/dev/null 2>&1
+  : > "$HIVE_DIR/.wake-$who"
+}
+
+drone_dir()  { echo "$DRONES_DIR/$1"; }
+drone_meta() { echo "$DRONES_DIR/$1/meta.json"; }
+
+meta_get() {  # meta_get <drone> <klucz>
+  [ -f "$(drone_meta "$1")" ] || return 1
+  python3 -c "
+import json,sys
+print(json.load(open('$(drone_meta "$1")')).get('$2',''))" 2>/dev/null
+}
+
+pane_of() { meta_get "$1" pane_id; }
+
+# Aktualny status panelu wprost z herdr (idle|working|blocked|unknown|dead)
+pane_status() {
+  local pane="$1" out
+  out=$(herdr pane get "$pane" 2>/dev/null) || { echo dead; return; }
+  echo "$out" | jqp "p=r.get('pane',r); print(p.get('agent_status') or 'unknown')" || echo dead
+}
+
+# UWAGA: `herdr pane read` zwraca SUROWY tekst, a `herdr agent read` JSON. Tu chcemy surowy.
+# Czy panel wisi na dialogu Claude Code (trust / permission / wybor)?
+pane_dialog() {
+  local pane="$1" txt
+  txt=$(herdr pane read "$pane" --source visible --lines 30 2>/dev/null) || return 1
+  case "$txt" in
+    *"trust this folder"*)        echo trust ;;
+    *"Yes, I accept"*)            echo consent ;;
+    *"Do you want to proceed"*)   echo permission ;;
+    *"requires approval"*)        echo permission ;;
+    *) return 1 ;;
+  esac
+}
+
+# --- komendy --------------------------------------------------------------
+
+cmd_spawn() {  # spawn <nazwa> [--cwd PATH] [--resume]
+  local name="${1:?uzycie: hive spawn <nazwa> [--cwd PATH]}"; shift
+  local cwd="$HOME" resume=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --cwd) cwd="$2"; shift 2 ;;
+      --resume) resume=1; shift ;;
+      *) die "nieznany argument: $1" ;;
+    esac
+  done
+  [ -d "$cwd" ] || die "cwd nie istnieje: $cwd"
+
+  local dir; dir=$(drone_dir "$name"); mkdir -p "$dir"
+  local sid
+  if [ "$resume" = 1 ] && sid=$(meta_get "$name" session_id) && [ -n "$sid" ]; then
+    : # wznawiamy istniejaca sesje
+  else
+    sid=$(python3 -c "import uuid;print(uuid.uuid4())")
+    resume=0
+  fi
+
+  # 1 workspace na drona, etykieta = nazwa drona
+  local ws
+  ws=$(herdr workspace create --label "$name" --no-focus 2>/dev/null \
+       | jqp "print(r['workspace']['workspace_id'])") \
+    || die "nie udalo sie utworzyc workspace"
+
+  # Protokol roju w system prompcie, nie w briefie — dron zna go od pierwszej tury
+  # i nie gubi przy kolejnych zadaniach. Brief zostaje czysto merytoryczny.
+  local sysprompt="Jestes dronem '$name' w roju agentow zarzadzanym przez koordynatora (inny Claude Code).
+Czlowiek NIE czyta twojego terminala — liczy sie wylacznie to, co zapiszesz i wyslesz.
+
+Raport z zadania: zapisz do $dir/report.md (format podaje brief). Bez raportu zadanie sie nie liczy.
+
+Poczta roju (komenda 'hive', jest w PATH):
+- wyslij: hive send <adresat> '<temat>' --body '<tresc>'   (adresat: coord | nazwa drona | all)
+- czytaj: hive inbox        (twoja skrzynka; konsumuje wiadomosci)
+- rój:    hive status       (kto zyje i nad czym siedzi)
+Gdy zobaczysz w prompcie 'HIVE-MAIL' — natychmiast odpal 'hive inbox' i obsluz tresc.
+Do rozmowy z innym dronem uzywaj WYLACZNIE 'hive send'. Nie uzywaj 'hive say' ani 'herdr' —
+to kanaly koordynatora i psujesz nimi kolejke.
+
+Pytania i blokady zglaszaj przez 'hive send coord' — nie czekaj bezczynnie, nikt nie patrzy w twoj panel."
+
+  local -a argv=(claude --dangerously-skip-permissions --model "$MODEL"
+                 --settings "$SKILL_DIR/drone-settings.json"
+                 --append-system-prompt "$sysprompt")
+  if [ "$resume" = 1 ]; then argv+=(--resume "$sid"); else argv+=(--session-id "$sid"); fi
+
+  # Panel koordynatora = ten, z ktorego wolano hive. Zapisujemy go, bo poczta do 'coord' tam trafia.
+  local coord; coord=$(herdr pane current 2>/dev/null | jqp "print(r['pane']['pane_id'])")
+  [ -n "$coord" ] && echo "$coord" > "$HIVE_DIR/coord.pane"
+
+  local pane
+  pane=$(herdr agent start "$name" --workspace "$ws" --cwd "$cwd" --no-focus \
+           --env "HIVE_DRONE=$name" --env "HIVE_DIR=$HIVE_DIR" \
+           --env "HERDR_HIVE_ROLE=drone" \
+           ${coord:+--env "HIVE_COORD_PANE=$coord"} \
+           -- "${argv[@]}" 2>/dev/null \
+         | jqp "print(r['agent']['pane_id'])") \
+    || { herdr workspace close "$ws" >/dev/null 2>&1; die "nie udalo sie wystartowac agenta"; }
+
+  # agent start robi split -> pusty shell z workspace create jest zbedny
+  sleep 1
+  herdr pane close "${ws}:p1" >/dev/null 2>&1
+
+  python3 - "$dir" "$name" "$ws" "$pane" "$sid" "$cwd" <<'PY'
+import json,sys
+d,name,ws,pane,sid,cwd = sys.argv[1:7]
+json.dump({"name":name,"workspace_id":ws,"pane_id":pane,"session_id":sid,"cwd":cwd},
+          open(f"{d}/meta.json","w"), indent=1)
+PY
+
+  # Bootstrap: trust dialog wyskakuje mimo --dangerously-skip-permissions (dla nowego cwd),
+  # bypass-consent przy pierwszym uzyciu skip-permissions na maszynie (opcja 2 = "Yes, I accept"),
+  # a hooki SessionStart potrafia zjesc pierwszy input. Czekamy na realna gotowosc promptu.
+  local i txt ready=0
+  for i in $(seq 1 25); do
+    sleep 1
+    case "$(pane_dialog "$pane" 2>/dev/null)" in
+      trust)
+        herdr pane send-keys "$pane" enter >/dev/null 2>&1
+        sleep 2; continue ;;
+      consent)
+        herdr pane send-text "$pane" 2 >/dev/null 2>&1
+        sleep 1
+        herdr pane send-keys "$pane" enter >/dev/null 2>&1
+        sleep 2; continue ;;
+    esac
+    txt=$(herdr pane read "$pane" --source visible --lines 40 2>/dev/null)
+    case "$txt" in
+      *"Claude Code v"*|*"bypass permissions"*)
+        [ "$(pane_status "$pane")" = idle ] && { ready=1; break; } ;;
+    esac
+  done
+  sleep 2   # niech hooki SessionStart dopisza swoje i zwolnia prompt
+  [ "$ready" = 1 ] || echo "uwaga: $name nie potwierdzil gotowosci — sprawdz: hive peek $name" >&2
+
+  echo "spawn: $name  ws=$ws pane=$pane model=$MODEL cwd=$cwd"
+  echo "sid=$sid"
+}
+
+cmd_task() {  # task <nazwa> <plik-briefu>  |  task <nazwa> - (brief z stdin)
+  local name="${1:?uzycie: hive task <nazwa> <plik|->}"; local src="${2:?brak briefu}"
+  local dir; dir=$(drone_dir "$name")
+  [ -f "$(drone_meta "$name")" ] || die "nieznany dron: $name"
+  local pane; pane=$(pane_of "$name")
+
+  if [ "$src" = "-" ]; then cat > "$dir/brief.md"; else cp "$src" "$dir/brief.md"; fi
+
+  # protokol raportowania doklejany do kazdego briefu
+  cat >> "$dir/brief.md" <<EOF
+
+---
+## Protokol raportowania (obowiazkowy)
+Po zakonczeniu zadania ZAPISZ raport do \`$dir/report.md\`:
+
+    STATUS: DONE | BLOCKED | FAILED
+    ## Wynik
+    <zwiezle: co zrobiles, co ustaliles>
+    ## Pliki
+    <zmienione/utworzone sciezki, albo "brak">
+    ## Problemy
+    <co poszlo nie tak, czego potrzebujesz, albo "brak">
+
+Raport to jedyny kanal do koordynatora — nikt nie czyta twojego terminala.
+Bez zapisanego raportu zadanie liczy sie jako niewykonane.
+Jesli utkniesz lub czegos potrzebujesz: zapisz raport ze STATUS: BLOCKED i opisz czego trzeba.
+EOF
+
+  rm -f "$dir/report.md"
+
+  # Dron swiezo po starcie potrafi zgubic input (hooki SessionStart czyszcza prompt),
+  # wiec wysylamy i POTWIERDZAMY dostarczenie: status musi przeskoczyc na 'working'.
+  local pending; pending=$(prompt_pending "$pane")
+  [ -n "$pending" ] && die "dron $name ma niewyslany tekst w prompcie: \"$pending\"
+Nie wysylam — Enter wyslalby TO, nie moje zadanie. Ogarnij prompt (hive clear $name) i powtorz."
+
+  local msg="Przeczytaj $dir/brief.md i wykonaj zadanie zgodnie z nim."
+  local attempt i st
+  for attempt in 1 2 3; do
+    herdr agent send "$name" "$msg" >/dev/null 2>&1 || die "nie udalo sie wyslac zadania do $name"
+    sleep 1
+    herdr pane send-keys "$pane" enter >/dev/null 2>&1
+    for i in 1 2 3 4 5 6; do
+      sleep 2
+      st=$(pane_status "$pane")
+      [ "$st" = working ] && { echo "task: $name <- $dir/brief.md (proba $attempt)"; return 0; }
+      [ "$st" = dead ] && die "dron $name nie zyje"
+    done
+  done
+  echo "task: $name — WYSLANE ale dron nie ruszyl (status: $(pane_status "$pane")). Sprawdz: hive peek $name" >&2
+  return 1
+}
+
+cmd_clear() {  # clear <nazwa> — czysci pole wejsciowe drona (ctrl+u)
+  local name="${1:?uzycie: hive clear <nazwa>}"
+  local pane; pane=$(pane_of "$name") || die "nieznany dron: $name"
+  local pending; pending=$(prompt_pending "$pane")
+  [ -z "$pending" ] && { echo "clear: $name — prompt juz czysty"; return 0; }
+  echo "clear: $name — usuwam z promptu: \"$pending\""
+  herdr pane send-keys "$pane" ctrl+u >/dev/null 2>&1
+  sleep 1
+  local still; still=$(prompt_pending "$pane")
+  [ -n "$still" ] && die "nie udalo sie wyczyscic promptu (zostalo: \"$still\")"
+  echo "clear: $name — czysto"
+}
+
+cmd_say() {  # say <nazwa> <tekst> — doraźna wiadomosc do drona
+  local name="${1:?uzycie: hive say <nazwa> <tekst>}"; shift
+  local pane; pane=$(pane_of "$name") || die "nieznany dron: $name"
+  local pending; pending=$(prompt_pending "$pane")
+  [ -n "$pending" ] && die "dron $name ma niewyslany tekst w prompcie: \"$pending\"
+Nie wysylam — Enter wyslalby TO. Ogarnij prompt (hive clear $name) i powtorz."
+  herdr agent send "$name" "$*" >/dev/null 2>&1 || die "nie udalo sie wyslac do $name"
+  sleep 1
+  herdr pane send-keys "$pane" enter >/dev/null 2>&1
+  echo "say: $name <- $*"
+}
+
+cmd_status() {  # status [nazwa...] — nigdy nie blokuje
+  local names=()
+  if [ $# -gt 0 ]; then names=("$@"); else
+    for d in "$DRONES_DIR"/*/; do [ -d "$d" ] && names+=("$(basename "$d")"); done
+  fi
+  [ ${#names[@]} -eq 0 ] && { echo "brak dronow"; return; }
+  printf '%-16s %-8s %-10s %-9s %s\n' DRON PANEL STATUS RAPORT ZADANIE
+  local n pane st rep brief
+  for n in "${names[@]}"; do
+    pane=$(pane_of "$n" 2>/dev/null) || pane="-"
+    st=$(pane_status "$pane")
+    if [ -f "$(drone_dir "$n")/report.md" ]; then
+      rep=$(grep -m1 -oE 'DONE|BLOCKED|FAILED' "$(drone_dir "$n")/report.md" 2>/dev/null || echo "jest")
+    else rep="-"; fi
+    brief=$(head -1 "$(drone_dir "$n")/brief.md" 2>/dev/null | cut -c1-40)
+    printf '%-16s %-8s %-10s %-9s %s\n' "$n" "$pane" "$st" "$rep" "${brief:--}"
+  done
+}
+
+cmd_wait() {  # wait [nazwa...] [--timeout SEC] — konczy na raporcie/blocked, ma twardy limit
+  local timeout=300 names=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --timeout) timeout="$2"; shift 2 ;;
+      *) names+=("$1"); shift ;;
+    esac
+  done
+  if [ ${#names[@]} -eq 0 ]; then
+    for d in "$DRONES_DIR"/*/; do [ -d "$d" ] && names+=("$(basename "$d")"); done
+  fi
+  local start; start=$(date +%s)
+  local n pane st done_all elapsed
+  while :; do
+    done_all=1
+    for n in "${names[@]}"; do
+      [ -f "$(drone_dir "$n")/report.md" ] && continue      # raport = koniec
+      pane=$(pane_of "$n" 2>/dev/null) || continue
+      st=$(pane_status "$pane")
+      case "$st" in
+        blocked|dead) continue ;;                            # tez koniec, ale zly
+        done)
+          # tura skonczona; raport moglby byc jeszcze niezflushowany — daj chwile
+          sleep 3
+          [ -f "$(drone_dir "$n")/report.md" ] || echo "wait: $n skonczyl ture BEZ raportu" >&2
+          continue ;;
+        *) done_all=0 ;;
+      esac
+    done
+    elapsed=$(( $(date +%s) - start ))
+    [ "$done_all" = 1 ] && break
+    [ "$elapsed" -ge "$timeout" ] && { echo "wait: limit ${timeout}s minal"; break; }
+    sleep 5
+  done
+  cmd_status "${names[@]}"
+}
+
+cmd_send() {  # send <do> <temat> [--body TEKST]  (bez --body: tresc ze stdin, opcjonalna)
+  local to="${1:?uzycie: hive send <do|all> <temat> [--body TEKST]}"; shift
+  local subject="${1:?brak tematu}"; shift
+  local body=""
+  case "${1:-}" in
+    --body) body="${2:-}" ;;
+    *) [ -t 0 ] || body=$(cat) ;;
+  esac
+  local from="${HIVE_DRONE:-coord}"
+
+  local -a targets=()
+  if [ "$to" = all ]; then
+    for d in "$DRONES_DIR"/*/; do
+      [ -d "$d" ] || continue
+      local n; n=$(basename "$d"); [ "$n" = "$from" ] || targets+=("$n")
+    done
+    [ "$from" = coord ] || targets+=(coord)
+  else
+    targets=("$to")
+  fi
+  [ ${#targets[@]} -eq 0 ] && { echo "send: brak adresatow"; return 0; }
+
+  local t
+  for t in "${targets[@]}"; do
+    mailbox_put "$from" "$t" "${KIND:-msg}" "$subject" "$body" || continue
+    wake_recipient "$t"
+    echo "send: $from -> $t: $subject"
+  done
+}
+
+cmd_inbox() {  # inbox [kto] [--keep] — czyta i konsumuje skrzynke (domyslnie wlasna)
+  local who="" keep=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --keep) keep=1; shift ;;
+      *) who="$1"; shift ;;
+    esac
+  done
+  [ -n "$who" ] || who="${HIVE_DRONE:-coord}"
+  local box="$MAIL_DIR/$who"
+  mkdir -p "$box"
+
+  local -a msgs=()
+  while IFS= read -r f; do msgs+=("$f"); done < <(find "$box" -maxdepth 1 -name '*.json' | sort)
+  if [ ${#msgs[@]} -eq 0 ]; then
+    echo "inbox ($who): pusto"; rm -f "$HIVE_DIR/.wake-$who"; return 0
+  fi
+
+  python3 -c "
+import json,sys
+for p in sys.argv[1:]:
+    try: e=json.load(open(p))
+    except Exception: continue
+    kind={'decision':'DECYZJA','done':'koniec'}.get(e.get('kind'),'wiadomosc')
+    print(f\"── {e.get('ts','?')}  od: {e.get('from','?')}  [{kind}]\")
+    print(f\"   {e.get('subject','')}\")
+    b=(e.get('body') or '').strip()
+    if b:
+        for line in b.splitlines(): print(f\"   | {line}\")
+" "${msgs[@]}"
+
+  if [ "$keep" = 0 ]; then
+    mkdir -p "$MAIL_DIR/.archive"
+    mv "${msgs[@]}" "$MAIL_DIR/.archive/" 2>/dev/null
+    rm -f "$HIVE_DIR/.wake-$who"   # zwolnij pobudke — kolejna partia moze znow obudzic
+  fi
+}
+
+cmd_report() {  # report <nazwa>
+  local name="${1:?uzycie: hive report <nazwa>}"
+  local f; f="$(drone_dir "$name")/report.md"
+  [ -f "$f" ] || { echo "brak raportu od $name (status: $(pane_status "$(pane_of "$name")"))"; return 1; }
+  cat "$f"
+}
+
+cmd_peek() {  # peek <nazwa> [linie] — podglad terminala drona
+  local name="${1:?uzycie: hive peek <nazwa> [linie]}"; local lines="${2:-40}"
+  local pane; pane=$(pane_of "$name") || die "nieznany dron: $name"
+  herdr pane read "$pane" --source visible --lines "$lines" 2>/dev/null \
+    || die "nie udalo sie odczytac panelu"
+}
+
+cmd_kill() {  # kill <nazwa> [--purge]
+  local name="${1:?uzycie: hive kill <nazwa> [--purge]}"; local purge="${2:-}"
+  local ws; ws=$(meta_get "$name" workspace_id) || die "nieznany dron: $name"
+  herdr workspace close "$ws" >/dev/null 2>&1
+  rm -f "$HIVE_DIR/.wake-$name"
+  if [ "$purge" = "--purge" ]; then
+    rm -rf "$(drone_dir "$name")" "$MAIL_DIR/$name"
+    echo "kill: $name (usuniety ze skrzynka i historia)"
+  else echo "kill: $name (workspace $ws zamkniety, raport zostaje)"; fi
+}
+
+cmd_rename() {  # rename <stara> <nowa>
+  local old="${1:?uzycie: hive rename <stara> <nowa>}"; local new="${2:?brak nowej nazwy}"
+  local ws pane; ws=$(meta_get "$old" workspace_id) || die "nieznany dron: $old"
+  pane=$(pane_of "$old")
+  herdr workspace rename "$ws" "$new" >/dev/null 2>&1
+  herdr agent rename "$pane" "$new" >/dev/null 2>&1
+  mv "$(drone_dir "$old")" "$(drone_dir "$new")"
+  python3 -c "
+import json
+p='$(drone_dir "$new")/meta.json'
+d=json.load(open(p)); d['name']='$new'; json.dump(d,open(p,'w'),indent=1)"
+  echo "rename: $old -> $new"
+}
+
+cmd_revive() {  # revive <nazwa> — wskrzesza drona z zachowaniem historii rozmowy
+  local name="${1:?uzycie: hive revive <nazwa>}"
+  local cwd; cwd=$(meta_get "$name" cwd) || die "nieznany dron: $name"
+  local ws; ws=$(meta_get "$name" workspace_id)
+  herdr workspace close "$ws" >/dev/null 2>&1
+  cmd_spawn "$name" --cwd "$cwd" --resume
+}
+
+case "${1:-}" in
+  spawn)  shift; cmd_spawn  "$@" ;;
+  task)   shift; cmd_task   "$@" ;;
+  say)    shift; cmd_say    "$@" ;;
+  clear)  shift; cmd_clear  "$@" ;;
+  send)   shift; cmd_send   "$@" ;;
+  inbox)  shift; cmd_inbox  "$@" ;;
+  coord)  herdr pane current 2>/dev/null | jqp "print(r['pane']['pane_id'])" > "$HIVE_DIR/coord.pane"
+          echo "coord: $(coord_pane)" ;;
+  _pending) shift; prompt_pending "${1:?brak panelu}" ;;   # wewnetrzne, dla drone-ping.sh
+  status) shift; cmd_status "$@" ;;
+  wait)   shift; cmd_wait   "$@" ;;
+  report) shift; cmd_report "$@" ;;
+  peek)   shift; cmd_peek   "$@" ;;
+  kill)   shift; cmd_kill   "$@" ;;
+  rename) shift; cmd_rename "$@" ;;
+  revive) shift; cmd_revive "$@" ;;
+  *) cat <<'EOF'
+hive — sterowanie rojem agentow Claude Code w herdr
+
+  hive spawn  <nazwa> [--cwd PATH]   nowy dron (opus, skip-permissions, wlasny workspace)
+  hive task   <nazwa> <plik|->       wyslij brief (z pliku lub stdin) + protokol raportu
+  hive say    <nazwa> <tekst>        doraźna wiadomosc do drona
+  hive clear  <nazwa>                wyczysc pole wejsciowe drona (gdy wisi tam cudzy tekst)
+  hive send   <do> <temat> [--body T] poczta roju (do: coord | dron | all) + pobudka adresata
+  hive inbox  [kto] [--keep]         czytaj i skonsumuj skrzynke (domyslnie wlasna)
+  hive coord                         zarejestruj biezacy panel jako panel koordynatora
+  hive status [nazwa]                tabela stanu roju (nigdy nie blokuje)
+  hive wait   [nazwy] [--timeout S]  czekaj na raporty, twardy limit (domyslnie 300s)
+  hive report <nazwa>                pokaz raport drona
+  hive peek   <nazwa> [linie]        podglad terminala drona
+  hive kill   <nazwa> [--purge]      ubij drona
+  hive rename <stara> <nowa>         zmien nazwe drona i workspace
+  hive revive <nazwa>                wskrzes drona z historia rozmowy (--resume)
+
+Model: $HIVE_MODEL (domyslnie opus).  Dane: ~/.herdr-hive/drones/<nazwa>/
+EOF
+  ;;
+esac

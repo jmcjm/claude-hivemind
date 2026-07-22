@@ -1,0 +1,28 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 20,
+            "command": "bash \"$HOME/.claude/skills/hivemind/drone-ping.sh\" done"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 20,
+            "command": "bash \"$HOME/.claude/skills/hivemind/drone-ping.sh\" decision"
+          }
+        ]
+      }
+    ]
+  }
+}
