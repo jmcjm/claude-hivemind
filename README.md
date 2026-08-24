@@ -1,14 +1,14 @@
-# Hivemind — rój agentów Claude Code w herdr
+# Hivemind — a swarm of Claude Code agents in herdr
 
-Paczka odtwarzająca 1:1 działający system, w którym **jeden Claude Code (koordynator) dowodzi
-rojem innych Claude Code (drony)** działających w osobnych panelach [herdr](https://herdr.dev).
-Człowiek rozmawia wyłącznie z koordynatorem i nie przegląda paneli dronów.
+A package reproducing 1:1 a working system in which **one Claude Code (the coordinator) commands
+a swarm of other Claude Codes (drones)** running in separate [herdr](https://herdr.dev) panels.
+The human talks only to the coordinator and never browses drone panels.
 
-Czytasz to jako Claude, który ma to postawić na nowej maszynie? Przeczytaj **całość**, zanim
-zaczniesz — sekcja „Dlaczego tak, a nie inaczej" opisuje pułapki, które kosztowały kilka
-spalonych dronów. Instalator jest łatwy, zrozumienie architektury jest tym, co się liczy.
+Reading this as a Claude who is supposed to set it up on a new machine? Read **all of it** before
+you start — the "Why this way and not another" section describes the traps that cost a few
+burnt drones. The installer is easy; understanding the architecture is what counts.
 
-## Instalacja
+## Installation
 
 ```bash
 git clone https://github.com/jmcjm/claude-hivemind.git
@@ -16,123 +16,123 @@ cd claude-hivemind
 ./install.sh
 ```
 
-Idempotentny. Każdy nadpisywany plik ląduje najpierw jako `*.bak-<timestamp>`. Robi sześć rzeczy:
-sprawdza wymagania, kopiuje skilla, wystawia `hive` w PATH, instaluje integrację herdr↔Claude Code,
-dopisuje sekcję do `~/.claude/CLAUDE.md`, weryfikuje składnię.
+Idempotent. Every overwritten file lands as `*.bak-<timestamp>` first. It does six things:
+checks requirements, copies the skill, exposes `hive` in PATH, installs the herdr↔Claude Code
+integration, appends a section to `~/.claude/CLAUDE.md`, verifies syntax.
 
-**Wymagania:** `herdr` (testowane na 0.7.3 i 0.7.4), `claude` (Claude Code CLI), `python3`, `flock`.
-Serwer herdr musi działać — sprawdź `herdr status`.
+**Requirements:** `herdr` (tested on 0.7.3 and 0.7.4), `claude` (Claude Code CLI), `python3`, `flock`.
+The herdr server must be running — check `herdr status`.
 
-## Weryfikacja, że odtworzyło się 1:1
+## Verifying the 1:1 reproduction
 
-Po instalacji uruchom test dymny. Powinno przejść **bez ani jednego ręcznego kliknięcia**:
+After installation run the smoke test. It should pass **without a single manual click**:
 
 ```bash
 hive coord                      # -> coord: wN:pM
-hive spawn testowy              # -> spawn: testowy  ws=.. pane=.. model=opus
-hive task testowy - <<'BRIEF'
-# Brief: testowy
-Napisz ile plików jest w katalogu domowym. Granice: tylko odczyt.
+hive spawn testdrone            # -> spawn: testdrone  ws=.. pane=.. model=opus
+hive task testdrone - <<'BRIEF'
+# Brief: testdrone
+Count the files in the home directory and report the number. Boundaries: read-only.
 BRIEF
-                                # -> task: testowy <- ... (proba 1)   <= MUSI być "proba 1"
+                                # -> task: testdrone <- ... (attempt 1)   <= MUST say "attempt 1"
 ```
 
-Teraz **nie pollinguj**. W ciągu ~30 s w prompcie koordynatora powinna sama pojawić się
-wiadomość `HIVE-MAIL: nowa poczta. Odpal: hive inbox`. Wtedy:
+Now **do not poll**. Within ~30 s the message `HIVE-MAIL: new mail. Run: hive inbox` should appear
+in the coordinator's prompt on its own. Then:
 
 ```bash
-hive inbox                      # -> wpis [koniec] od drona "testowy"
-hive report testowy             # -> STATUS: DONE + treść
-hive kill testowy --purge
+hive inbox                      # -> a [finished] entry from drone "testdrone"
+hive report testdrone           # -> STATUS: DONE + content
+hive kill testdrone --purge
 ```
 
-Jeśli `task` pokazał „proba 2/3" — dron gubił input, ale mechanizm ponawiania zadziałał (OK).
-Jeśli `HIVE-MAIL` nie przyszedł — patrz „Diagnostyka" niżej.
+If `task` showed "attempt 2/3" — the drone was losing input, but the retry mechanism worked (OK).
+If `HIVE-MAIL` never arrived — see "Diagnostics" below.
 
-## Co gdzie ląduje
+## What lands where
 
-| Ścieżka | Rola |
+| Path | Role |
 |---|---|
-| `~/.claude/skills/hivemind/SKILL.md` | doktryna dla koordynatora, ładowana automatycznie |
-| `~/.claude/skills/hivemind/hive` | CLI roju (wrapper na `herdr`) |
-| `~/.claude/skills/hivemind/drone-ping.sh` | hook dronów: melduje koniec tury / potrzebę decyzji |
-| `~/.claude/skills/hivemind/drone-settings.json` | hooki `Stop`/`Notification` **tylko dla dronów** |
-| `~/.local/bin/hive` | symlink, żeby drony miały `hive` w PATH |
-| `~/.claude/CLAUDE.md` | sekcja „Hivemind" — tożsamość koordynatora |
-| `~/.claude/hooks/herdr-agent-state.sh` | instalowane przez `herdr integration install claude` |
-| `~/.herdr-hive/drones/<nazwa>/` | `meta.json`, `brief.md`, `report.md` |
-| `~/.herdr-hive/mail/<adresat>/` | skrzynki pocztowe (plik = wiadomość) |
+| `~/.claude/skills/hivemind/SKILL.md` | doctrine for the coordinator, loaded automatically |
+| `~/.claude/skills/hivemind/hive` | swarm CLI (a wrapper around `herdr`) |
+| `~/.claude/skills/hivemind/drone-ping.sh` | drone hook: reports end of turn / needed decision |
+| `~/.claude/skills/hivemind/drone-settings.json` | `Stop`/`Notification` hooks **for drones only** |
+| `~/.local/bin/hive` | symlink so drones have `hive` in PATH |
+| `~/.claude/CLAUDE.md` | the "Hivemind" section — the coordinator's identity |
+| `~/.claude/hooks/herdr-agent-state.sh` | installed by `herdr integration install claude` |
+| `~/.herdr-hive/drones/<name>/` | `meta.json`, `brief.md`, `report.md` |
+| `~/.herdr-hive/mail/<recipient>/` | mailboxes (file = message) |
 
-Globalny `~/.claude/settings.json` dostaje **wyłącznie** hook integracji herdr. Hooki roju
-jadą przez `--settings` dronów, więc sesja człowieka jest nietknięta.
+The global `~/.claude/settings.json` receives **only** the herdr integration hook. Swarm hooks
+ride on the drones' `--settings`, so the human's session is untouched.
 
-## Architektura
+## Architecture
 
-**Dron = workspace herdr = panel z interaktywnym Claude Code na opus.** Workspace nosi nazwę
-drona, więc człowiek widzi rój w sidebarze i może w każdej chwili przejąć dowolny panel.
+**Drone = herdr workspace = a panel with an interactive Claude Code on opus.** The workspace carries
+the drone's name, so the human sees the swarm in the sidebar and can take over any panel at any time.
 
-**Komunikacja idzie przez pliki, nie przez terminal.** Brief → `brief.md`, wynik → `report.md`.
-TUI czyta się (`hive peek`) wyłącznie do diagnozy.
+**Communication goes through files, not the terminal.** Brief → `brief.md`, result → `report.md`.
+The TUI is read (`hive peek`) strictly for diagnosis.
 
-**Drony wołają koordynatora, nie odwrotnie.** Hooki `Stop` i `Notification` wysyłają list do
-skrzynki `coord` i wstrzykują koordynatorowi pobudkę `HIVE-MAIL` prosto w prompt. Koordynator
-oddaje turę i wraca dopiero, gdy jest po co — zero pollingu.
+**Drones call the coordinator, not the other way around.** The `Stop` and `Notification` hooks mail
+the `coord` mailbox and inject a `HIVE-MAIL` wake-up straight into the coordinator's prompt. The
+coordinator yields the turn and comes back only when there is a reason to — zero polling.
 
-**Poczta to katalog z plikami**, bez demona i bez MTA. Zapis atomowy (`mktemp` + `mv`).
-Adresaci: `coord`, nazwa drona, `all`. Drony gadają ze sobą tym samym kanałem.
+**Mail is a directory of files**, no daemon and no MTA. Atomic writes (`mktemp` + `mv`).
+Recipients: `coord`, a drone name, `all`. Drones talk to each other over the same channel.
 
-## Dlaczego tak, a nie inaczej
+## Why this way and not another
 
-Każdy z tych punktów wynika ze spalonego drona albo zawieszonego koordynatora. Nie „upraszczaj" ich.
+Each of these points comes from a burnt drone or a hung coordinator. Do not "simplify" them.
 
-1. **`--dangerously-skip-permissions`, nie `acceptEdits`.** Przy `acceptEdits` dron staje na
-   pierwszym pytaniu o Bash (u nas: `xargs`) i cały rój czeka. Konsekwencja: dron o nic nie zapyta,
-   więc **granice muszą być w briefie** („tylko odczyt", „zero deployu").
-2. **Żadnych blokujących `herdr wait` bez limitu.** Gdy dron utknie, koordynator wisi razem z nim
-   i człowiek traci jedyny interfejs. `hive wait` ma twardy timeout i kończy też na `blocked`/`dead`.
-3. **Sygnałem ukończenia jest `report.md`, nie status agenta.** `idle` znaczy tylko „nie generuje
-   teraz tokenów" — dron wiszący na dialogu też jest `idle`.
-4. **`workspace create` + `agent start` daje DWA panele**, bo `agent start` zawsze robi split.
-   `hive spawn` zamyka osierocony shell `<ws>:p1`.
-5. **Świeży dron gubi pierwszy input** — hooki `SessionStart` czyszczą prompt. `hive task` potwierdza
-   dostarczenie (status musi przeskoczyć na `working`) i ponawia do 3 razy.
-6. **Prompt jest współdzielony z człowiekiem.** Wysłanie Entera wysłałoby tekst, który człowiek
-   właśnie pisze. `hive task`/`say`/`wake_recipient` sprawdzają to i odmawiają.
-7. **Ale ghost text to nie tekst człowieka.** Claude Code podpowiada gotowe prompty przygaszonym
-   tekstem (SGR `2`). Naiwny detektor bierze je za input i **blokuje każdego bezczynnego drona**.
-   `prompt_pending` czyta `--format ansi` i liczy tylko znaki spoza fragmentów dim.
-8. **Protokół roju siedzi w `--append-system-prompt`, nie w briefie.** Gdy był w briefie,
-   dron improwizował i zamiast `hive send` używał `hive say`, omijając skrzynkę i bezpieczniki.
-9. **Jedna pobudka na partię** (marker `.wake-<kto>`) + `flock`. Bez tego pięć dronów kończących
-   naraz wpisuje się jednocześnie w jeden prompt i wychodzi z tego sieczka.
+1. **`--dangerously-skip-permissions`, not `acceptEdits`.** With `acceptEdits` a drone stops at the
+   first Bash question (in our case: `xargs`) and the whole swarm waits. Consequence: the drone will
+   ask about nothing, so **boundaries must be in the brief** ("read-only", "zero deploys").
+2. **No blocking `herdr` waits without a limit.** When a drone gets stuck, the coordinator hangs with
+   it and the human loses their only interface. `hive wait` has a hard timeout and also ends on `blocked`/`dead`.
+3. **The completion signal is `report.md`, not the agent status.** `idle` means only "not generating
+   tokens right now" — a drone hanging on a dialog is `idle` too.
+4. **`workspace create` + `agent start` yields TWO panes**, because `agent start` always does a split.
+   `hive spawn` closes the orphaned `<ws>:p1` shell.
+5. **A fresh drone loses its first input** — `SessionStart` hooks clear the prompt. `hive task` confirms
+   delivery (the status must jump to `working`) and retries up to 3 times.
+6. **The prompt is shared with the human.** Sending Enter would send the text the human is typing
+   right now. `hive task`/`say`/`wake_recipient` check for this and refuse.
+7. **But ghost text is not human text.** Claude Code suggests ready-made prompts as dimmed text
+   (SGR `2`). A naive detector takes them for input and **blocks every idle drone**.
+   `prompt_pending` reads `--format ansi` and counts only characters outside dim fragments.
+8. **The swarm protocol sits in `--append-system-prompt`, not in the brief.** When it lived in the
+   brief, drones improvised and used `hive say` instead of `hive send`, bypassing the mailbox and the safeguards.
+9. **One wake-up per batch** (the `.wake-<who>` marker) + `flock`. Without it, five drones finishing
+   at once all type into one prompt simultaneously and the result is mush.
 
-## Kruczki herdr 0.7.x
+## herdr 0.7.x technicalities
 
-- `herdr pane read` zwraca **surowy tekst**, `herdr agent read` **JSON**. Łatwo się naciąć.
-- `herdr agent send` pisze tekst **bez Entera** — trzeba dosłać `pane send-keys <pane> enter`.
-- `herdr pane current` poprawnie wykrywa panel wołającego (stąd `hive coord`).
-- `herdr agent start --env K=V` propaguje zmienne do procesu drona (tak drony poznają `HIVE_DRONE`).
-- Trust dialog („Is this a project you trust?") wyskakuje dla nieufanego `--cwd` **mimo**
-  `--dangerously-skip-permissions`. `hive spawn` wykrywa go i akceptuje.
-- Pierwszy spawn na świeżej maszynie ma dodatkowy dialog pierwszego uruchomienia —
-  `hive spawn` obsługuje go w bootstrapie tak samo jak trust dialog.
-- Statusy: `idle | working | blocked | done | unknown` (`dead` dokłada `hive`).
+- `herdr pane read` returns **raw text**, `herdr agent read` returns **JSON**. Easy to get burnt.
+- `herdr agent send` types text **without Enter** — you must follow up with `pane send-keys <pane> enter`.
+- `herdr pane current` correctly detects the caller's pane (hence `hive coord`).
+- `herdr agent start --env K=V` propagates variables into the drone process (that is how drones learn `HIVE_DRONE`).
+- The trust dialog ("Is this a project you trust?") appears for an untrusted `--cwd` **despite**
+  `--dangerously-skip-permissions`. `hive spawn` detects and accepts it.
+- The first spawn on a fresh machine has an extra first-run dialog —
+  `hive spawn` handles it in the bootstrap the same way as the trust dialog.
+- Statuses: `idle | working | blocked | done | unknown` (`dead` is added by `hive`).
 
-## Diagnostyka
+## Diagnostics
 
-| Objaw | Przyczyna | Ruch |
+| Symptom | Cause | Move |
 |---|---|---|
-| `HIVE-MAIL` nie przychodzi | `coord.pane` wskazuje panel poprzedniej sesji | `hive coord`, potem `hive inbox` |
-| `HIVE-MAIL` nie przychodzi, coord OK | człowiek ma tekst w prompcie — pobudka wstrzymana | list czeka w skrzynce: `hive inbox` |
-| `hive task` mówi „dron nie ruszył" | dron wisi na dialogu | `hive peek <dron>` |
-| dron `idle`, brak raportu | uznał zadanie za skończone bez zapisu | `hive say <dron> "zapisz raport do <ścieżka>"` |
-| status `dead` | dron ubity lub padł | `hive revive <dron>` — historia rozmowy zostaje |
-| `hive revive` gubi historię | brak integracji herdr | `herdr integration status` → ma być `claude: current` |
-| drony omijają skrzynkę | stary spawn bez system promptu | ubij i zespawnuj od nowa |
+| `HIVE-MAIL` never arrives | `coord.pane` points at a previous session's panel | `hive coord`, then `hive inbox` |
+| `HIVE-MAIL` never arrives, coord OK | human has text in the prompt — wake-up withheld | the letter waits in the mailbox: `hive inbox` |
+| `hive task` says the drone did not start | drone hanging on a dialog | `hive peek <drone>` |
+| drone `idle`, no report | considered the task done without writing | `hive say <drone> "write the report to <path>"` |
+| status `dead` | drone killed or crashed | `hive revive <drone>` — conversation history survives |
+| `hive revive` loses history | herdr integration missing | `herdr integration status` → must say `claude: current` |
+| drones bypass the mailbox | old spawn without the system prompt | kill and spawn anew |
 
-## Dostosowanie
+## Customization
 
-- Model dronów: `HIVE_MODEL=sonnet hive spawn <nazwa>` (domyślnie `opus`).
-- Katalog roju: `HIVE_DIR=/inna/sciezka` (spójnie dla wszystkich wywołań).
-- Język: skill i system prompt dronów są po polsku — przetłumacz `SKILL.md` oraz `$sysprompt`
-  w funkcji `cmd_spawn`, jeśli docelowy człowiek mówi po angielsku.
+- Drone model: `HIVE_MODEL=sonnet hive spawn <name>` (default `opus`).
+- Swarm directory: `HIVE_DIR=/other/path` (consistently for all invocations).
+- Language: the skill and the drones' system prompt are in English — translate `SKILL.md` and
+  `$sysprompt` in the `cmd_spawn` function if the target human speaks another language.
