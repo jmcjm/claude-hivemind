@@ -599,15 +599,23 @@ cmd_gate() {  # gate enter|release|status|queue|force-release [description]
       exec 8>"$HIVE_DIR/.gate-lock"
       flock -w 10 8 || { echo "gate: cannot take the gate lock (10 s) — try again." >&2; return 5; }
       if [ "$kind" = ENTER ]; then
-        local open
+        # Capacity 2 since 2026-08-24 (RAM 15G -> 24G): two windows may run side by side; the third
+        # is refused. Cores are still 8, so browser-proof-bearing runs SAY SO in the description and
+        # avoid pairing with another proof-bearing run; any flake under a pair -> A-B-A, then solo.
+        local open n_open cap="${HIVE_GATE_CAPACITY:-2}"
         open=$(awk '{last[$2]=$3; line[$2]=$0} END{for (w in last) if (last[w]=="ENTER") print line[w]}' \
                  "$HIVE_DIR/gate.log" 2>/dev/null | sort)
-        if [ -n "$open" ]; then
-          echo "gate: REFUSED — a window is OPEN and has not been released:" >&2
+        n_open=0; [ -n "$open" ] && n_open=$(printf '%s\n' "$open" | wc -l)
+        if [ "$n_open" -ge "$cap" ]; then
+          echo "gate: REFUSED — $n_open open window(s) at capacity $cap:" >&2
           printf '%s\n' "$open" | sed 's/^/  /' >&2
           echo "      You do not enter. Wait for a NAMED release or write to the coordinator." >&2
-          echo "      If that window is DEAD (its drone is gone): hive gate force-release <drone> '<reason>'" >&2
+          echo "      If a window is DEAD (its drone is gone): hive gate force-release <drone> '<reason>'" >&2
           return 3
+        fi
+        if [ "$n_open" -ge 1 ]; then
+          echo "gate: entering as window $((n_open+1)) of $cap — already open:"
+          printf '%s\n' "$open" | sed 's/^/  /'
         fi
       fi
       printf '%s %s %s %s\n' "$(date -Is)" "$who" "$kind" "$desc" >> "$HIVE_DIR/gate.log"
@@ -644,7 +652,10 @@ cmd_gate() {  # gate enter|release|status|queue|force-release [description]
       fi
       if [ -z "$open" ]; then echo "gate: FREE (no window is open)"; return 0; fi
       local n; n=$(printf '%s\n' "$open" | wc -l)
-      if [ "$n" -gt 1 ]; then echo "gate: COLLISION — $n open windows:"; else echo "gate: BUSY:"; fi
+      local cap="${HIVE_GATE_CAPACITY:-2}"
+      if [ "$n" -gt "$cap" ]; then echo "gate: COLLISION — $n open windows over capacity $cap:";
+      elif [ "$n" -ge "$cap" ]; then echo "gate: FULL ($n of $cap windows):";
+      else echo "gate: BUSY ($n of $cap windows):"; fi
       printf '%s\n' "$open" | sed 's/^/  /'
       return 3 ;;
     *) echo "usage: hive gate enter|release|status|queue|force-release [description]"; return 2 ;;

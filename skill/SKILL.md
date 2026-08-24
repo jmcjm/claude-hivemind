@@ -75,7 +75,10 @@ they have `hive send`, because only that reaches the mailbox and passes through 
 Full test gates and browser proofs contend for CPU/RAM; two at once produce flaky results that read
 as real failures. `hive gate` is a flock-backed exclusive window over `~/.herdr-hive/gate.log`:
 
-- `hive gate enter '<what for, ~N min>'` — refuses while any window is open; refuses an empty
+- `hive gate enter '<what for, ~N min>'` — refuses once open windows reach capacity
+  (`HIVE_GATE_CAPACITY`, default 2); a run that includes browser proofs SAYS SO in its description
+  and avoids pairing with another proof-bearing run — any flake under a pair means A-B-A, then solo.
+  Also refuses an empty
   description (accidental entries — e.g. backticks in an echo — are never intentional).
 - `hive gate release` — closes YOUR window. A dead drone's window is closed only by
   `hive gate force-release <drone> '<reason>'`.
