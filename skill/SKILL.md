@@ -70,6 +70,22 @@ Three wake-up safeguards, all in `wake_recipient`:
 `hive say` is your channel to a drone (prompt injection). Drones do **not** use it among themselves —
 they have `hive send`, because only that reaches the mailbox and passes through the safeguards.
 
+## The machine gate — one window for anything that eats the whole machine
+
+Full test gates and browser proofs contend for CPU/RAM; two at once produce flaky results that read
+as real failures. `hive gate` is a flock-backed exclusive window over `~/.herdr-hive/gate.log`:
+
+- `hive gate enter '<what for, ~N min>'` — refuses while any window is open; refuses an empty
+  description (accidental entries — e.g. backticks in an echo — are never intentional).
+- `hive gate release` — closes YOUR window. A dead drone's window is closed only by
+  `hive gate force-release <drone> '<reason>'`.
+- `hive gate status` — all open windows (two at once = COLLISION, printed as such) plus the
+  coordinator's queue; an empty queue does NOT mean "free to enter".
+- `hive gate queue set|pop|clear` — the coordinator's assignment order, kept where drones look.
+
+Every brief that includes a full gate must carry: "full gates ONLY via hive gate enter/release;
+targeted test runs with a small filter need no slot."
+
 ## Iron rules
 
 1. **Never block forever.** No `herdr agent wait` or `herdr pane wait-output` without `--timeout` —

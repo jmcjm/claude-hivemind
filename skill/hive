@@ -526,6 +526,131 @@ cmd_revive() {  # revive <name> — resurrects a drone with its conversation his
   cmd_spawn "$name" --cwd "$cwd" --resume
 }
 
+# AN ACT, NOT A DESCRIPTION. Reason (ffprobegate, 2026-07-28): every LETTER about the gate contains
+# gate words — that is a property of correspondence, not a flaw of the pattern; the more precisely the
+# swarm describes the gate, the more phantoms a content filter sees. Filtering by subject text is
+# undecidable BY PRINCIPLE. So entering and releasing are a SEPARATE COMMAND with nothing in common
+# with sending mail: the act stops being a description and becomes an invocation.
+# Position 1 used to mean TWO things at once: "the one INSIDE" and "the one who is NEXT". Both looked
+# identical (a bare number) and telling them apart required combining two sources instead of one read.
+gate_queue_print() {
+  local qf="$1" in_window i=0
+  # The "already had a window" marker must refer to THIS round of the queue, not all history: the first
+  # version marked everyone whose LAST event was a RELEASE — including three hours ago on another task.
+  # An overbroad claim, same family as "at all" / "7/7". Only releases AFTER the queue was set count
+  # (queue file mtime).
+  local after_window qset
+  qset=$(date -d "@$(stat -c %Y "$qf" 2>/dev/null || echo 0)" -Is 2>/dev/null || echo 0)
+  after_window=$(awk -v since="$qset" '$3=="RELEASE" && $1 > since {seen[$2]=1} END{for (w in seen) print w}' \
+             "$HIVE_DIR/gate.log" 2>/dev/null)
+  in_window=$(awk '{last[$2]=$3} END{for (w in last) if (last[w]=="ENTER") print w}' \
+            "$HIVE_DIR/gate.log" 2>/dev/null)
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    i=$((i+1))
+    if printf '%s\n' "$in_window" | grep -qx -- "$n"; then
+      printf '%2d. %s  <- IN THE WINDOW NOW (not waiting)\n' "$i" "$n"
+    elif printf '%s\n' "$after_window" | grep -qx -- "$n"; then
+      # The queue and gate.log used to say TWO DIFFERENT things about one person — released at 12:33,
+      # still listed as "waiting" five minutes later, because `pop` is done by a HUMAN. An entry whose
+      # owner already has a RELEASE in the log is marked — the coordinator still decides the pop, but
+      # nobody has to guess it by eye.
+      printf '%2d. %s  (ALREADY HAD A WINDOW — pop it: hive gate queue pop)\n' "$i" "$n"
+    else
+      printf '%2d. %s  (waiting)\n' "$i" "$n"
+    fi
+  done < "$qf"
+}
+
+# The machine gate: one exclusive window for anything that eats the whole machine (full test gates,
+# browser proofs). History that shaped it, condensed: three drones entered within four minutes when
+# `enter` did not check the log; check-then-append without a lock left a race window; entries without
+# a description turned out to be backticks in echo messages, never intentional.
+cmd_gate() {  # gate enter|release|status|queue|force-release [description]
+  local sub="${1:?usage: hive gate enter|release|status|queue|force-release [description]}"; shift || true
+  local who="${HIVE_DRONE:-coord}" desc="${*:-}"
+  case "$sub" in
+    # `status` answers "is someone INSIDE"; the queue answers "who is PROMISED next". The queue must
+    # live WHERE PEOPLE LOOK — not in someone else's mailbox (two collisions in one day taught this).
+    queue)
+      local qf="$HIVE_DIR/gate.queue" sub2="${1:-list}"; shift || true
+      case "$sub2" in
+        set)   printf '%s\n' "$@" | tr ' ' '\n' | grep -v '^$' > "$qf"; echo "queue set:"; gate_queue_print "$qf" ;;
+        pop)   if [ -s "$qf" ]; then h=$(head -1 "$qf"); tail -n +2 "$qf" > "$qf.tmp" && mv "$qf.tmp" "$qf"; echo "popped: $h"; else echo "queue empty"; fi ;;
+        clear) : > "$qf"; echo "queue cleared" ;;
+        *)     if [ -s "$qf" ]; then gate_queue_print "$qf"; else echo "queue empty"; fi ;;
+      esac
+      return 0 ;;
+    enter|release)
+      local kind=ENTER; [ "$sub" = release ] && kind=RELEASE
+      # An entry without a description is never intentional: whoever enters deliberately says what for
+      # and roughly how long. Refusing closes the whole class of accidental entries (backticks in echo
+      # once RAN `hive gate enter` with an empty description — zero human decisions involved).
+      if [ "$kind" = ENTER ] && [ -z "${desc//[[:space:]]/}" ]; then
+        echo "gate: ENTER WITHOUT A DESCRIPTION — not recording." >&2
+        echo "      Whoever enters deliberately says WHAT FOR and HOW LONG: hive gate enter '<desc, ~N min>'" >&2
+        echo "      If you did not invoke this on purpose: check for BACKTICKS in echo messages." >&2
+        return 2
+      fi
+      # `enter` used to append a line and nothing more — the gate admitted everyone who typed the
+      # command; three concurrent windows in four minutes were measured from gate.log. Discipline that
+      # depends on a drone reading `status` output IS NOT a gate. And check-then-append is not atomic
+      # without a lock: two `enter`s in the same instant would both see a free gate. flock closes it.
+      exec 8>"$HIVE_DIR/.gate-lock"
+      flock -w 10 8 || { echo "gate: cannot take the gate lock (10 s) — try again." >&2; return 5; }
+      if [ "$kind" = ENTER ]; then
+        local open
+        open=$(awk '{last[$2]=$3; line[$2]=$0} END{for (w in last) if (last[w]=="ENTER") print line[w]}' \
+                 "$HIVE_DIR/gate.log" 2>/dev/null | sort)
+        if [ -n "$open" ]; then
+          echo "gate: REFUSED — a window is OPEN and has not been released:" >&2
+          printf '%s\n' "$open" | sed 's/^/  /' >&2
+          echo "      You do not enter. Wait for a NAMED release or write to the coordinator." >&2
+          echo "      If that window is DEAD (its drone is gone): hive gate force-release <drone> '<reason>'" >&2
+          return 3
+        fi
+      fi
+      printf '%s %s %s %s\n' "$(date -Is)" "$who" "$kind" "$desc" >> "$HIVE_DIR/gate.log"
+      echo "gate: $who $kind $desc" ;;
+    # The only emergency exit: a window left by a dead drone would block the gate FOREVER, because
+    # `release` closes its OWN author's window. A reason is required — closing someone else's window
+    # without one is indistinguishable from ignoring the gate.
+    force-release)
+      local victim="${1:?usage: hive gate force-release <drone> '<reason>'}"; shift || true
+      local reason="${*:-}"
+      if [ -z "${reason//[[:space:]]/}" ]; then
+        echo "gate: force-release WITHOUT A REASON — not recording." >&2
+        return 2
+      fi
+      printf '%s %s %s %s\n' "$(date -Is)" "$victim" RELEASE \
+        "RELEASED BY $who: $reason" >> "$HIVE_DIR/gate.log"
+      echo "gate: $who CLOSED the window of drone $victim — $reason" ;;
+    status)
+      # The log is append-only, so file order IS time order; we never compare timestamps (awk once read
+      # "2026-07-28T..." as the number 2026 on both sides — "later than" was always false). For EVERY
+      # person we take their LAST record, and we report ALL open windows, not just the latest: two
+      # unreleased entries are a COLLISION, and showing only the last one sweeps it under the rug.
+      if [ -s "$HIVE_DIR/gate.queue" ]; then
+        echo "queue (coordinator's assignment, top first):"
+        gate_queue_print "$HIVE_DIR/gate.queue" | sed 's/^/  /'
+      else
+        echo "queue: EMPTY — that does NOT mean \"free to enter\". Ask the coordinator."
+      fi
+      local open
+      open=$(awk '{last[$2]=$3; line[$2]=$0} END{for (w in last) if (last[w]=="ENTER") print line[w]}' \
+                "$HIVE_DIR/gate.log" 2>/dev/null | sort)
+      if ! grep -q ' ENTER ' "$HIVE_DIR/gate.log" 2>/dev/null; then
+        echo "gate: NO ENTRIES in the log — that does NOT mean free. Ask."; return 4
+      fi
+      if [ -z "$open" ]; then echo "gate: FREE (no window is open)"; return 0; fi
+      local n; n=$(printf '%s\n' "$open" | wc -l)
+      if [ "$n" -gt 1 ]; then echo "gate: COLLISION — $n open windows:"; else echo "gate: BUSY:"; fi
+      printf '%s\n' "$open" | sed 's/^/  /'
+      return 3 ;;
+    *) echo "usage: hive gate enter|release|status|queue|force-release [description]"; return 2 ;;
+  esac
+}
+
 case "${1:-}" in
   spawn)  shift; cmd_spawn  "$@" ;;
   task)   shift; cmd_task   "$@" ;;
@@ -544,6 +669,7 @@ case "${1:-}" in
   kill)   shift; cmd_kill   "$@" ;;
   rename) shift; cmd_rename "$@" ;;
   revive) shift; cmd_revive "$@" ;;
+  gate)   shift; cmd_gate   "$@" ;;
   *) cat <<'EOF'
 hive — command a swarm of Claude Code agents in herdr
 
@@ -562,6 +688,7 @@ hive — command a swarm of Claude Code agents in herdr
   hive kill   <name> [--purge]       kill a drone
   hive rename <old> <new>            rename a drone and its workspace
   hive revive <name>                 resurrect a drone with its history (--resume)
+  hive gate   <enter|release|status|queue> [desc]  one exclusive machine window for full gates (flock-backed)
 
 Model: $HIVE_MODEL (default opus).  Data: ~/.herdr-hive/drones/<name>/
 EOF
