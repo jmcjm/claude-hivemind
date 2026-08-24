@@ -26,7 +26,7 @@ $1" 2>/dev/null; }
 
 # Returns text sitting in the drone's input field (last '>' line in the frame), empty when clean.
 # CRITICAL: the prompt is shared with the human. If the user typed something and did not send it,
-# our 'enter' would send THEIR text, and our 'send' would glue itself onto their sentence.
+# our 'enter' would send THEIR text, and our message would glue itself onto their sentence.
 prompt_pending() {
   local pane="$1"
   herdr pane read "$pane" --source visible --lines 60 --format ansi 2>/dev/null | python3 -c "
@@ -85,12 +85,12 @@ wake_recipient() {
   exec 9>"$HIVE_DIR/.wake-lock"
   flock -w 15 9 || return 0
   [ -f "$HIVE_DIR/.wake-$who" ] && return 0        # already woken, do not spam
-  [ "$(pane_status "$pane")" = dead ] && return 0
+  case "$(pane_status "$pane")" in dead|blocked) return 0 ;; esac
   [ -n "$(prompt_pending "$pane")" ] && return 0   # human is typing — leave it, mail can wait
 
-  herdr agent send "$pane" "HIVE-MAIL: new mail. Run: hive inbox" >/dev/null 2>&1 || return 0
-  sleep 1
-  herdr pane send-keys "$pane" enter >/dev/null 2>&1
+  # herdr 0.8: agent prompt appends Enter itself and honors bracketed-paste; for a recipient
+  # mid-turn Claude Code queues the message, and one stuck at a dialog is rejected (agent_blocked).
+  herdr agent prompt "$pane" "HIVE-MAIL: new mail. Run: hive inbox" >/dev/null 2>&1 || return 0
   : > "$HIVE_DIR/.wake-$who"
 }
 
@@ -113,7 +113,6 @@ pane_status() {
   echo "$out" | jqp "p=r.get('pane',r); print(p.get('agent_status') or 'unknown')" || echo dead
 }
 
-# NOTE: `herdr pane read` returns RAW text, while `herdr agent read` returns JSON. We want raw here.
 # Is the pane stuck on a Claude Code dialog (trust / permission / choice)?
 pane_dialog() {
   local pane="$1" txt
@@ -131,6 +130,10 @@ pane_dialog() {
 
 cmd_spawn() {  # spawn <name> [--cwd PATH] [--resume]
   local name="${1:?usage: hive spawn <name> [--cwd PATH]}"; shift
+  # herdr 0.8: the drone name doubles as the herdr agent name — [a-z][a-z0-9_-]{0,31} applies,
+  # unique among live agents.
+  [[ "$name" =~ ^[a-z][a-z0-9_-]{0,31}$ ]] \
+    || die "name '$name' rejected: herdr requires [a-z][a-z0-9_-]{0,31}"
   local cwd="$HOME" resume=0
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -150,11 +153,21 @@ cmd_spawn() {  # spawn <name> [--cwd PATH] [--resume]
     resume=0
   fi
 
-  # 1 workspace per drone, label = drone name
-  local ws
-  ws=$(herdr workspace create --label "$name" --no-focus 2>/dev/null \
-       | jqp "print(r['workspace']['workspace_id'])") \
+  # Coordinator pane = the one hive was called from. Saved because mail to 'coord' lands there.
+  # (herdr 0.8.2: --current resolves the CALLING pane, not the pane focused in another client)
+  local coord; coord=$(herdr pane current --current 2>/dev/null | jqp "print(r['pane']['pane_id'])")
+  [ -n "$coord" ] && echo "$coord" > "$HIVE_DIR/coord.pane"
+
+  # 1 workspace per drone, label = drone name. Swarm environment variables enter here —
+  # herdr 0.8 injects --env into the root pane shell, and agent start has no --env at all.
+  local -a envs=(--env "HIVE_DRONE=$name" --env "HIVE_DIR=$HIVE_DIR" --env "HERDR_HIVE_ROLE=drone")
+  [ -n "$coord" ] && envs+=(--env "HIVE_COORD_PANE=$coord")
+  local ws_json ws pane
+  ws_json=$(herdr workspace create --label "$name" --cwd "$cwd" --no-focus "${envs[@]}" 2>/dev/null) \
     || die "failed to create workspace"
+  ws=$(jqp "print(r['workspace']['workspace_id'])" <<<"$ws_json")
+  pane=$(jqp "print(r['root_pane']['pane_id'])" <<<"$ws_json")
+  [ -n "$ws" ] && [ -n "$pane" ] || die "workspace create returned an incomplete response: $ws_json"
 
   # Swarm protocol lives in the system prompt, not in the brief — the drone knows it from
   # turn one and never loses it across tasks. The brief stays purely about the work.
@@ -172,28 +185,28 @@ To talk to another drone use ONLY 'hive send'. Do not use 'hive say' or 'herdr' 
 those are coordinator channels and you would corrupt the queue with them.
 
 Report questions and blockers via 'hive send coord' — do not wait idly, nobody watches your panel."
+  # herdr 0.8 cannot encode a multi-line argument for the target shell (invalid_agent_argument),
+  # so the system prompt goes as a single line.
+  sysprompt=$(printf '%s' "$sysprompt" | tr '\n' ' ' | tr -s ' ')
 
-  local -a argv=(claude --dangerously-skip-permissions --model "$MODEL"
+  local -a argv=(--dangerously-skip-permissions --model "$MODEL"
                  --settings "$SKILL_DIR/drone-settings.json"
                  --append-system-prompt "$sysprompt")
   if [ "$resume" = 1 ]; then argv+=(--resume "$sid"); else argv+=(--session-id "$sid"); fi
 
-  # Coordinator pane = the one hive was called from. Saved because mail to 'coord' lands there.
-  local coord; coord=$(herdr pane current 2>/dev/null | jqp "print(r['pane']['pane_id'])")
-  [ -n "$coord" ] && echo "$coord" > "$HIVE_DIR/coord.pane"
-
-  local pane
-  pane=$(herdr agent start "$name" --workspace "$ws" --cwd "$cwd" --no-focus \
-           --env "HIVE_DRONE=$name" --env "HIVE_DIR=$HIVE_DIR" \
-           --env "HERDR_HIVE_ROLE=drone" \
-           ${coord:+--env "HIVE_COORD_PANE=$coord"} \
-           -- "${argv[@]}" 2>/dev/null \
-         | jqp "print(r['agent']['pane_id'])") \
-    || { herdr workspace close "$ws" >/dev/null 2>&1; die "failed to start the agent"; }
-
-  # agent start does a split -> the empty shell from workspace create is redundant
-  sleep 1
-  herdr pane close "${ws}:p1" >/dev/null 2>&1
+  # herdr 0.8: agent start targets an EXISTING pane (no splits, no orphaned shells)
+  # and waits for agent readiness itself. On a startup dialog it returns agent_not_ready,
+  # but the agent name stays live — the dialog is handled below.
+  local start_out ready=0
+  start_out=$(herdr agent start "$name" --kind claude --pane "$pane" --timeout 60000 \
+                -- "${argv[@]}" 2>&1) && ready=1
+  if [ "$ready" != 1 ]; then
+    case "$start_out" in
+      *agent_not_ready*) : ;;   # startup dialog — handled in the bootstrap below
+      *) herdr workspace close "$ws" >/dev/null 2>&1
+         die "failed to start the agent: $start_out" ;;
+    esac
+  fi
 
   python3 - "$dir" "$name" "$ws" "$pane" "$sid" "$cwd" <<'PY'
 import json,sys
@@ -202,27 +215,23 @@ json.dump({"name":name,"workspace_id":ws,"pane_id":pane,"session_id":sid,"cwd":c
           open(f"{d}/meta.json","w"), indent=1)
 PY
 
-  # Bootstrap: the trust dialog appears despite --dangerously-skip-permissions (for a new cwd),
-  # the bypass consent on first skip-permissions use on a machine (option 2 = "Yes, I accept"),
-  # and SessionStart hooks can eat the first input. Wait for real prompt readiness.
-  local i txt ready=0
-  for i in $(seq 1 25); do
-    sleep 1
+  # Startup dialog bootstrap: the trust dialog appears despite --dangerously-skip-permissions
+  # (for a new cwd), and the bypass consent on first skip-permissions use on a machine
+  # (option 2 = "Yes, I accept"). herdr reports both as 'blocked'.
+  local i
+  for i in $(seq 1 12); do
+    [ "$ready" = 1 ] && break
     case "$(pane_dialog "$pane" 2>/dev/null)" in
       trust)
-        herdr pane send-keys "$pane" enter >/dev/null 2>&1
-        sleep 2; continue ;;
+        herdr agent send-keys "$name" enter >/dev/null 2>&1
+        sleep 2 ;;
       consent)
         herdr pane send-text "$pane" 2 >/dev/null 2>&1
         sleep 1
-        herdr pane send-keys "$pane" enter >/dev/null 2>&1
-        sleep 2; continue ;;
+        herdr agent send-keys "$name" enter >/dev/null 2>&1
+        sleep 2 ;;
     esac
-    txt=$(herdr pane read "$pane" --source visible --lines 40 2>/dev/null)
-    case "$txt" in
-      *"Claude Code v"*|*"bypass permissions"*)
-        [ "$(pane_status "$pane")" = idle ] && { ready=1; break; } ;;
-    esac
+    herdr agent wait "$name" --until idle --until done --timeout 5000 >/dev/null 2>&1 && ready=1
   done
   sleep 2   # let SessionStart hooks finish their thing and release the prompt
   [ "$ready" = 1 ] || echo "warning: $name did not confirm readiness — check: hive peek $name" >&2
@@ -261,21 +270,34 @@ EOF
 
   rm -f "$dir/report.md"
 
-  # A freshly started drone can lose input (SessionStart hooks clear the prompt),
-  # so we send and CONFIRM delivery: the status must jump to 'working'.
+  local msg="Read $dir/brief.md and carry out the task it describes."
+  # 'done' = the previous turn finished. Remember the pre-send state so a stale 'done'
+  # cannot masquerade as delivery of the new task.
+  local pre; pre=$(pane_status "$pane")
+  [ "$pre" = dead ] && die "drone $name is dead"
+  if [ "$pre" = working ]; then
+    # Drone mid-turn: Claude Code queues the message, so deliver once and do not retry
+    # (a retry would push the task into the queue a SECOND time).
+    herdr agent prompt "$name" "$msg" >/dev/null 2>&1 || die "failed to send the task to $name"
+    echo "task: $name is working — task queued, will run after the current turn"
+    return 0
+  fi
+
   local pending; pending=$(prompt_pending "$pane")
   [ -n "$pending" ] && die "drone $name has unsent text in its prompt: \"$pending\"
 Not sending — Enter would send THAT, not my task. Sort the prompt out (hive clear $name) and retry."
 
-  local msg="Read $dir/brief.md and carry out the task it describes."
-  # 'done' = the previous turn finished, the input field is ready again. Remember the
-  # pre-send state so a stale 'done' cannot masquerade as delivery of the new task.
-  local pre; pre=$(pane_status "$pane")
-  local attempt i st
+  # herdr 0.8: agent prompt appends Enter atomically, and rejects a drone stuck at a dialog
+  # (agent_blocked) without sending anything. Delivery is still CONFIRMED via status —
+  # a freshly started drone can still lose its first input (SessionStart hooks clear the prompt).
+  local attempt i st out
   for attempt in 1 2 3; do
-    herdr agent send "$name" "$msg" >/dev/null 2>&1 || die "failed to send the task to $name"
-    sleep 1
-    herdr pane send-keys "$pane" enter >/dev/null 2>&1
+    out=$(herdr agent prompt "$name" "$msg" 2>&1) || {
+      case "$out" in
+        *agent_blocked*) die "drone $name is stuck at a dialog — check: hive peek $name" ;;
+        *) die "failed to send the task to $name: $out" ;;
+      esac
+    }
     for i in 1 2 3 4 5 6; do
       sleep 2
       st=$(pane_status "$pane")
@@ -310,9 +332,11 @@ cmd_say() {  # say <name> <text> — ad-hoc message to a drone
   local pending; pending=$(prompt_pending "$pane")
   [ -n "$pending" ] && die "drone $name has unsent text in its prompt: \"$pending\"
 Not sending — Enter would send THAT. Sort the prompt out (hive clear $name) and retry."
-  herdr agent send "$name" "$*" >/dev/null 2>&1 || die "failed to send to $name"
-  sleep 1
-  herdr pane send-keys "$pane" enter >/dev/null 2>&1
+  local out
+  out=$(herdr agent prompt "$name" "$*" 2>&1) || case "$out" in
+    *agent_blocked*) die "drone $name is stuck at a dialog — check: hive peek $name" ;;
+    *) die "failed to send to $name: $out" ;;
+  esac
   echo "say: $name <- $*"
 }
 
@@ -480,6 +504,8 @@ cmd_kill() {  # kill <name> [--purge]
 
 cmd_rename() {  # rename <old> <new>
   local old="${1:?usage: hive rename <old> <new>}"; local new="${2:?missing new name}"
+  [[ "$new" =~ ^[a-z][a-z0-9_-]{0,31}$ ]] \
+    || die "name '$new' rejected: herdr requires [a-z][a-z0-9_-]{0,31}"
   local ws pane; ws=$(meta_get "$old" workspace_id) || die "unknown drone: $old"
   pane=$(pane_of "$old")
   herdr workspace rename "$ws" "$new" >/dev/null 2>&1
@@ -507,7 +533,7 @@ case "${1:-}" in
   clear)  shift; cmd_clear  "$@" ;;
   send)   shift; cmd_send   "$@" ;;
   inbox)  shift; cmd_inbox  "$@" ;;
-  coord)  herdr pane current 2>/dev/null | jqp "print(r['pane']['pane_id'])" > "$HIVE_DIR/coord.pane"
+  coord)  herdr pane current --current 2>/dev/null | jqp "print(r['pane']['pane_id'])" > "$HIVE_DIR/coord.pane"
           echo "coord: $(coord_pane)" ;;
   _pending) shift; prompt_pending "${1:?missing pane}" ;;   # internal, for drone-ping.sh
   status) shift; cmd_status "$@" ;;

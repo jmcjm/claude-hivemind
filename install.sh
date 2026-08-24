@@ -20,7 +20,11 @@ command -v flock  >/dev/null || die "flock missing (util-linux package)"
 ok "herdr $(herdr --version 2>/dev/null | awk '{print $2}')"
 ok "claude $(claude --version 2>/dev/null | awk '{print $1}')"
 HERDR_MAJOR_MINOR=$(herdr --version 2>/dev/null | awk '{print $2}' | cut -d. -f1,2)
-[ "$HERDR_MAJOR_MINOR" = "0.7" ] || warn "tested on herdr 0.7.x — on another version check the 'herdr technicalities' section in SKILL.md"
+case "$HERDR_MAJOR_MINOR" in
+  0.8) : ;;
+  0.7) die "herdr 0.7.x will not work with this version (no agent prompt / agent start into an existing pane) — update herdr or use commit 604848c" ;;
+  *)   warn "tested on herdr 0.8.x — on another version check the 'herdr technicalities' section in SKILL.md" ;;
+esac
 
 echo "== 2/6 Skill files =="
 mkdir -p "$SKILL_DST"

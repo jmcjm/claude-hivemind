@@ -20,8 +20,9 @@ Idempotent. Every overwritten file lands as `*.bak-<timestamp>` first. It does s
 checks requirements, copies the skill, exposes `hive` in PATH, installs the herdr↔Claude Code
 integration, appends a section to `~/.claude/CLAUDE.md`, verifies syntax.
 
-**Requirements:** `herdr` (tested on 0.7.3 and 0.7.4), `claude` (Claude Code CLI), `python3`, `flock`.
-The herdr server must be running — check `herdr status`.
+**Requirements:** `herdr` **≥ 0.8** (tested on 0.8.2 — 0.7.5 removed `agent send` and the top-level
+`wait` that the old version rode on; for herdr 0.7.x use commit `604848c`), `claude`
+(Claude Code CLI), `python3`, `flock`. The herdr server must be running — check `herdr status`.
 
 ## Verifying the 1:1 reproduction
 
@@ -92,10 +93,11 @@ Each of these points comes from a burnt drone or a hung coordinator. Do not "sim
    it and the human loses their only interface. `hive wait` has a hard timeout and also ends on `blocked`/`dead`.
 3. **The completion signal is `report.md`, not the agent status.** `idle` means only "not generating
    tokens right now" — a drone hanging on a dialog is `idle` too.
-4. **`workspace create` + `agent start` yields TWO panes**, because `agent start` always does a split.
-   `hive spawn` closes the orphaned `<ws>:p1` shell.
-5. **A fresh drone loses its first input** — `SessionStart` hooks clear the prompt. `hive task` confirms
-   delivery (the status must jump to `working`) and retries up to 3 times.
+4. **Swarm variables go through `workspace create --env`**, because `agent start` (0.8) starts the
+   agent in the existing root pane and has no `--env` of its own. That is how drones learn `HIVE_DRONE`.
+5. **A fresh drone loses its first input** — `SessionStart` hooks clear the prompt, and `herdr agent
+   prompt` without `--wait` does not confirm receipt. `hive task` confirms delivery (the status must
+   jump to `working`) and retries up to 3 times.
 6. **The prompt is shared with the human.** Sending Enter would send the text the human is typing
    right now. `hive task`/`say`/`wake_recipient` check for this and refuse.
 7. **But ghost text is not human text.** Claude Code suggests ready-made prompts as dimmed text
@@ -106,17 +108,28 @@ Each of these points comes from a burnt drone or a hung coordinator. Do not "sim
 9. **One wake-up per batch** (the `.wake-<who>` marker) + `flock`. Without it, five drones finishing
    at once all type into one prompt simultaneously and the result is mush.
 
-## herdr 0.7.x technicalities
+## herdr 0.8.x technicalities
 
-- `herdr pane read` returns **raw text**, `herdr agent read` returns **JSON**. Easy to get burnt.
-- `herdr agent send` types text **without Enter** — you must follow up with `pane send-keys <pane> enter`.
-- `herdr pane current` correctly detects the caller's pane (hence `hive coord`).
-- `herdr agent start --env K=V` propagates variables into the drone process (that is how drones learn `HIVE_DRONE`).
+- Public IDs are short stable handles (`w1`, `w1:t1`, `w1:p1`); IDs of closed panes are never
+  reused. Always take them from JSON responses.
+- `herdr agent *` commands are addressed by **agent name** (= drone name) or pane ID.
+  Name: `[a-z][a-z0-9_-]{0,31}`, unique among live agents.
+- `herdr agent start <name> --kind claude --pane <id>` starts in an **existing** shell pane —
+  zero splits. Drone env enters via `workspace create --env`.
+- `herdr agent prompt` appends Enter atomically and returns immediately; an agent at a dialog →
+  `agent_blocked`, nothing gets sent. `--timeout` works only with `--wait`.
+  The old `agent send` and top-level `wait` are gone since 0.7.5.
+- `pane read` and `agent read` return raw text. A fresh pane can have an empty
+  `--source recent` — for diagnosis use `visible`.
+- `herdr pane current --current` gives the **caller's** pane (hence `hive coord`).
 - The trust dialog ("Is this a project you trust?") appears for an untrusted `--cwd` **despite**
-  `--dangerously-skip-permissions`. `hive spawn` detects and accepts it.
+  `--dangerously-skip-permissions`; herdr reports it as `blocked` and `agent start`
+  returns `agent_not_ready`. `hive spawn` detects and accepts it.
 - The first spawn on a fresh machine has an extra first-run dialog —
   `hive spawn` handles it in the bootstrap the same way as the trust dialog.
-- Statuses: `idle | working | blocked | done | unknown` (`dead` is added by `hive`).
+- Statuses: `idle | working | blocked | done | unknown` (`dead` is added by `hive`). `done` is idle
+  after work finished outside UI focus — CLI reads do not clear it.
+- The official API cheat sheet: `herdr --skill`.
 
 ## Diagnostics
 

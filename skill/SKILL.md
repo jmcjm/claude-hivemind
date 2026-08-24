@@ -72,7 +72,7 @@ they have `hive send`, because only that reaches the mailbox and passes through 
 
 ## Iron rules
 
-1. **Never block forever.** No `herdr wait agent-status` without a limit —
+1. **Never block forever.** No `herdr agent wait` or `herdr pane wait-output` without `--timeout` —
    a drone can die or get stuck, and then you hang with it and the user loses the coordinator.
    `hive wait` has a hard timeout and also ends on `blocked`/`dead`.
 2. **Drones run with `--dangerously-skip-permissions`.** Without it they hang on the first
@@ -84,8 +84,8 @@ they have `hive send`, because only that reaches the mailbox and passes through 
    That is NOT user text and does not block sending — `hive` tells them apart by ANSI.
    Do not try to read the prompt with plain `pane read` without `--format ansi`, you will not tell the difference.
 4. **Always confirm task delivery.** A freshly started drone loses its first input
-   (SessionStart hooks clear the prompt). `hive task` verifies the jump to `working`
-   and retries up to 3 times.
+   (SessionStart hooks clear the prompt), and `herdr agent prompt` without `--wait` does not
+   confirm receipt. `hive task` verifies the jump to `working` and retries up to 3 times.
 5. **Report a synthesis to the user, not raw output.** Do not paste drone reports wholesale.
    They should get conclusions, conflicts between drones, and whatever needs their decision.
 6. **CLAUDE.md rules bind the drones.** Production requires the user's explicit consent —
@@ -140,23 +140,42 @@ that is long, resumable, and observable by the user.
 
 | Symptom | Cause | Move |
 |---|---|---|
-| `hive task` says the drone did not start | the prompt ate the input or the drone hangs on a dialog | `hive peek <drone>` |
-| status `blocked` | dialog despite skip-permissions | `hive peek`, answer via `herdr pane send-keys <pane> enter` |
+| `hive task` says "not delivered" | drone stuck on a dialog or unresponsive | `hive peek <drone>` |
+| status `blocked` | dialog despite skip-permissions | `hive peek`, answer via `herdr agent send-keys <drone> enter` |
 | status `dead` / missing panel | drone killed or crashed | `hive revive <drone>` — conversation history survives |
 | drone `idle`, no report | considered the task done without writing | `hive say <drone> "write the report to <path>"` |
 | trust dialog on a new `--cwd` | folder untrusted in `~/.claude.json` | `hive spawn` handles it itself; if stubborn, `peek` + enter |
 | first-run dialog in swarm mode | first spawn on a fresh machine | `hive spawn` handles it itself, like the trust dialog |
 
-## herdr technicalities (0.7.3)
+## herdr technicalities (0.8.2)
 
-- `herdr pane read` returns **raw text**, while `herdr agent read` returns **JSON**. Easy to get burnt.
-- `herdr agent start` **always does a split**, so `workspace create` + `agent start` yields
-  two panes. `hive spawn` closes the orphaned `<ws>:p1` shell.
-- `herdr agent send` types text **without Enter** — you must follow up with `pane send-keys <pane> enter`.
+- Public IDs are short stable handles: workspace `w1`, tab `w1:t1`, pane `w1:p1`.
+  IDs of closed panes are **never reused**. Always take them from JSON responses.
+- `herdr agent *` commands are addressed by **agent name** (here = drone name) or pane ID.
+  The name must match `[a-z][a-z0-9_-]{0,31}` and be unique among live agents —
+  `hive spawn`/`rename` validate this.
+- `herdr agent start <name> --kind claude --pane <id>` starts the agent in an **existing**
+  shell pane — zero splits. `hive spawn` uses the root pane from `workspace create`.
+  Environment variables enter via `workspace create --env` (`agent start` has no `--env`).
+- `herdr agent prompt <drone> "<text>"` appends Enter **atomically** (honors bracketed-paste)
+  and returns immediately; an agent stuck at a dialog is rejected with `agent_blocked` —
+  nothing gets sent. With `--wait` it waits for a settled state (`--timeout` works only with
+  `--wait`; 5 s with no reaction at all → `agent_prompt_stalled`). The old `herdr agent send`
+  and top-level `herdr wait` **do not exist** (removed in 0.7.5).
+- `pane read` and `agent read` return **raw text** (not JSON). Sources: `visible`
+  (current screen), `recent`/`recent-unwrapped` (recent output; unwrapped joins soft
+  wraps — for logs), `agent read` also has `detection`. `--format ansi` when colors matter
+  (ghost text!). A fresh pane can have empty `recent` — for diagnosis use `visible`.
+- Claude Code dialogs of the "Enter to confirm · Esc to cancel" kind are reported by herdr
+  as `blocked` (in 0.7.x they masqueraded as `idle`).
 - The `herdr integration install claude` integration (a `SessionStart` hook) reports the
   `session_id` and transcript path to herdr — that is what makes `revive` possible. Check:
-  `herdr integration status`.
+  `herdr integration status`. A drone's session id is also visible in `herdr agent get <drone>`
+  (the `agent_session` field).
 - `--session-id <uuid>` at startup gives a deterministic ID for a later `--resume`.
 - Statuses: `idle | working | blocked | done | unknown` (+ `dead` added by `hive`).
-  `done` = turn finished. `idle` = simply not generating tokens right now — including when
-  the drone hangs on a dialog. That is why the completion signal is `report.md`, not the status.
+  `done` = the same idle, only after work finished in the background, outside UI focus
+  (CLI reads do **not** clear `done`). `unknown` proves nothing. The task completion signal
+  is `report.md` anyway, not the status.
+- The official API cheat sheet for agents: `herdr --skill`. Check versions with `herdr --version`
+  and `herdr status server`.
