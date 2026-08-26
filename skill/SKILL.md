@@ -22,6 +22,7 @@ hive clear  <name>                 clear the drone's input field
 hive send   <to> <subject> [--body T] swarm mail (to: coord | drone | all) + recipient wake-up
 hive inbox  [who] [--keep]         read and consume a mailbox (own by default)
 hive coord                         register the current pane as the coordinator pane
+hive coord --remote <ssh-host>     the coordinator lives on another machine — forward coord mail over ssh
 hive status [names]                swarm state table — NEVER blocks
 hive wait   [names] [--timeout S]  wait for reports, hard limit (default 300 s)
 hive report <name>                 a drone's report
@@ -69,6 +70,45 @@ Three wake-up safeguards, all in `wake_recipient`:
 
 `hive say` is your channel to a drone (prompt injection). Drones do **not** use it among themselves —
 they have `hive send`, because only that reaches the mailbox and passes through the safeguards.
+
+## Remote fleet — drones on another machine
+
+The coordinator can run drones on a second machine over ssh. Requirements on the drone machine:
+hivemind installed (`~/.claude/skills/hivemind/hive`), a headless herdr server
+(`herdr server`, e.g. as a systemd user service), and non-interactive ssh from the coordinator's
+machine. The alias in `~/.ssh/config` should match the machine's hostname — sender tags in mail
+(`drone@<host>`) then double as the ssh target for reaching that fleet.
+
+Adopting a remote fleet, from the coordinator's pane:
+
+```bash
+R=fast-box                                        # ssh alias of the drone machine
+ssh $R hive status || echo "unreachable — spawn locally instead"
+ssh $R hive coord --remote <my-machine-ssh-alias> # their coord mail now forwards to ME over ssh
+ssh $R hive spawn kafka --cwd /path/on/remote
+ssh $R "hive task kafka -" <<'EOF'
+# Brief: kafka
+...
+EOF
+```
+
+How the mail flows back: `hive coord --remote <host>` drops a `coord.remote` marker on the drone
+machine. Drone hooks fire `hive send coord` as usual; with the marker present the letter travels
+over ssh into the coordinator machine's mailbox and wakes the coordinator's pane **there** —
+the event-driven doctrine survives across machines, no polling. The sender arrives as
+`<drone>@<host>`, so you know which fleet is talking; read its report with `ssh <host> hive report <drone>`.
+If the forward fails (link down), the letter stays in the drone machine's mailbox — collect it
+with `ssh <host> hive inbox` when the link returns.
+
+Traps:
+- **Probe before you spawn.** `ssh <host> hive status` with a short timeout decides remote vs local.
+  A fleet is not "available" just because ping answers — hive needs the herdr server up.
+- **`hive spawn`/`hive coord` run locally on the drone machine reclaim the fleet** (they clear
+  `coord.remote`): a human sitting at that machine coordinating locally wins over a remote king.
+  After that, mail stops forwarding — re-adopt with `hive coord --remote` if that was not intended.
+- **`hive wait` does not span machines** — use `ssh <host> hive wait ...` (it has its own hard timeout).
+- The remote fleet's data lives on the remote machine (`~/.herdr-hive` there). Briefs, reports,
+  gate windows — all per-machine; a gate on one machine does not protect the other.
 
 ## The machine gate — one window for anything that eats the whole machine
 

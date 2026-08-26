@@ -82,6 +82,12 @@ coordinator yields the turn and comes back only when there is a reason to — ze
 **Mail is a directory of files**, no daemon and no MTA. Atomic writes (`mktemp` + `mv`).
 Recipients: `coord`, a drone name, `all`. Drones talk to each other over the same channel.
 
+**The fleet can span machines.** `hive coord --remote <ssh-host>` on a drone machine forwards its
+coord mail over ssh to the coordinator's machine, waking the coordinator's pane there — the
+event-driven flow survives across hosts. The coordinator drives the remote fleet with plain
+`ssh <host> hive spawn/task/report ...`; senders arrive tagged `<drone>@<host>`. Requirements on
+the drone machine: hivemind installed, a headless herdr server (`herdr server`), non-interactive ssh.
+
 ## Why this way and not another
 
 Each of these points comes from a burnt drone or a hung coordinator. Do not "simplify" them.

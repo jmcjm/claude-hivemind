@@ -59,6 +59,9 @@ print(last)
 
 coord_pane() { cat "$HIVE_DIR/coord.pane" 2>/dev/null; }
 
+# Non-empty when the coordinator lives on another machine (hive coord --remote <ssh-host>).
+coord_remote() { cat "$HIVE_DIR/coord.remote" 2>/dev/null; }
+
 mailbox_put() {  # mailbox_put <from> <to> <kind> <subject> <body>
   local from="$1" to="$2" kind="$3" subject="$4" body="$5"
   local box="$MAIL_DIR/$to"; mkdir -p "$box"
@@ -79,7 +82,12 @@ json.dump({'ts':time.strftime('%Y-%m-%d %H:%M:%S'),'from':frm,'to':to,
 #  - marker: one wake-up per batch, until the recipient runs 'hive inbox'
 wake_recipient() {
   local who="$1" pane=""
-  if [ "$who" = coord ]; then pane=$(coord_pane); else pane=$(pane_of "$who" 2>/dev/null); fi
+  if [ "$who" = coord ]; then
+    # A remote coordinator has no pane on this machine — the letter waits in the mailbox
+    # (cmd_send forwards over ssh; this path only runs when that forward failed).
+    [ -n "$(coord_remote)" ] && return 0
+    pane=$(coord_pane)
+  else pane=$(pane_of "$who" 2>/dev/null); fi
   [ -n "$pane" ] || return 0
 
   exec 9>"$HIVE_DIR/.wake-lock"
@@ -156,7 +164,10 @@ cmd_spawn() {  # spawn <name> [--cwd PATH] [--resume]
   # Coordinator pane = the one hive was called from. Saved because mail to 'coord' lands there.
   # (herdr 0.8.2: --current resolves the CALLING pane, not the pane focused in another client)
   local coord; coord=$(herdr pane current --current 2>/dev/null | jqp "print(r['pane']['pane_id'])")
-  [ -n "$coord" ] && echo "$coord" > "$HIVE_DIR/coord.pane"
+  # Spawning from a local pane makes THIS pane the coordinator — a stale remote marker
+  # would silently divert the fleet's mail to another machine. Over ssh there is no
+  # calling pane, so a remote coordinator's registration survives untouched.
+  [ -n "$coord" ] && { echo "$coord" > "$HIVE_DIR/coord.pane"; rm -f "$HIVE_DIR/coord.remote"; }
 
   # 1 workspace per drone, label = drone name. Swarm environment variables enter here —
   # herdr 0.8 injects --env into the root pane shell, and agent start has no --env at all.
@@ -418,8 +429,23 @@ cmd_send() {  # send <to> <subject> [--body TEXT]  (without --body: body from st
   fi
   [ ${#targets[@]} -eq 0 ] && { echo "send: no recipients"; return 0; }
 
-  local t
+  local t remote lhost
+  remote=$(coord_remote); lhost=$(hostname -s)
   for t in "${targets[@]}"; do
+    # Remote coordinator (hive coord --remote): coord mail travels over ssh and lands in the
+    # coordinator machine's mailbox, waking their pane THERE. The sender arrives as
+    # '<name>@<this host>' so the coordinator knows which machine's fleet is talking.
+    # When ssh fails, the letter stays in the local mailbox — undelivered but not lost;
+    # the coordinator can still collect it with 'ssh <host> hive inbox'.
+    if [ "$t" = coord ] && [ -n "$remote" ]; then
+      if printf '%s' "$body" | ssh -o BatchMode=yes -o ConnectTimeout=5 "$remote" \
+           "HIVE_DRONE=$(printf '%q' "$from@$lhost") KIND=$(printf '%q' "${KIND:-msg}") \
+            \"\$HOME/.claude/skills/hivemind/hive\" send coord $(printf '%q' "$subject")" \
+           >/dev/null 2>&1; then
+        echo "send: $from -> coord@$remote: $subject"
+        continue
+      fi
+    fi
     mailbox_put "$from" "$t" "${KIND:-msg}" "$subject" "$body" || continue
     wake_recipient "$t"
     echo "send: $from -> $t: $subject"
@@ -670,8 +696,17 @@ case "${1:-}" in
   clear)  shift; cmd_clear  "$@" ;;
   send)   shift; cmd_send   "$@" ;;
   inbox)  shift; cmd_inbox  "$@" ;;
-  coord)  herdr pane current --current 2>/dev/null | jqp "print(r['pane']['pane_id'])" > "$HIVE_DIR/coord.pane"
-          echo "coord: $(coord_pane)" ;;
+  coord)  shift
+          if [ "${1:-}" = --remote ]; then
+            [ -n "${2:-}" ] || die "usage: hive coord --remote <ssh-host>"
+            printf '%s\n' "$2" > "$HIVE_DIR/coord.remote"
+            rm -f "$HIVE_DIR/coord.pane"
+            echo "coord: remote at $2 — coord mail is forwarded over ssh"
+          else
+            rm -f "$HIVE_DIR/coord.remote"
+            herdr pane current --current 2>/dev/null | jqp "print(r['pane']['pane_id'])" > "$HIVE_DIR/coord.pane"
+            echo "coord: $(coord_pane)"
+          fi ;;
   _pending) shift; prompt_pending "${1:?missing pane}" ;;   # internal, for drone-ping.sh
   status) shift; cmd_status "$@" ;;
   wait)   shift; cmd_wait   "$@" ;;
@@ -692,6 +727,7 @@ hive — command a swarm of Claude Code agents in herdr
   hive send   <to> <subject> [--body T] swarm mail (to: coord | drone | all) + recipient wake-up
   hive inbox  [who] [--keep]         read and consume a mailbox (own by default)
   hive coord                         register the current pane as the coordinator pane
+  hive coord --remote <ssh-host>     coordinator lives on another machine — forward coord mail over ssh
   hive status [name]                 swarm state table (never blocks)
   hive wait   [names] [--timeout S]  wait for reports, hard limit (default 300s)
   hive report <name>                 show a drone's report
