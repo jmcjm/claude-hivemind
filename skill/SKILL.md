@@ -32,6 +32,7 @@ hive kill   <name> [--purge]       kill a drone; an already dead one is archived
 hive prune  [--purge] [--dry-run] [names]  clear out dead drones — archives them, then removes
 hive rename <old> <new>            rename a drone and its workspace
 hive revive <name>                 resurrection with full conversation history (--resume)
+hive unblock <name>                answer the dialog a drone is stuck on (resume/trust/consent)
 hive sweep                         reconciliation pass — retry lost wake-ups, surface silent drones
 ```
 
@@ -240,7 +241,8 @@ that is long, resumable, and observable by the user.
 | Symptom | Cause | Move |
 |---|---|---|
 | `hive task` says "not delivered" | drone stuck on a dialog or unresponsive | `hive peek <drone>` |
-| status `blocked` | dialog despite skip-permissions | `hive peek`, answer via `herdr agent send-keys <drone> enter` |
+| status `blocked` | dialog despite skip-permissions | `hive peek <drone>`, then `hive unblock <drone>` |
+| drone silent, panel shows "Resume from summary" | its context ran out; the session asks how to resume | `hive unblock <drone>` — the sweep names this one explicitly |
 | status `dead` / missing panel | drone killed or crashed | `hive revive <drone>` — conversation history survives |
 | `dead` drones piling up in `status` | directories outlive the sessions | `hive prune --dry-run`, then `hive prune` |
 | drone `idle`, no report | considered the task done without writing | `hive say <drone> "write the report to <path>"` |

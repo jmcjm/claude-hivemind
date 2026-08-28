@@ -146,6 +146,7 @@ Each of these points comes from a burnt drone or a hung coordinator. Do not "sim
 | `hive task` says the drone did not start | drone hanging on a dialog | `hive peek <drone>` |
 | drone `idle`, no report | considered the task done without writing | `hive say <drone> "write the report to <path>"` |
 | status `dead` | drone killed or crashed | `hive revive <drone>` — conversation history survives |
+| drone stuck at a dialog (`blocked`) | trust/consent dialog, or its context ran out | `hive unblock <drone>` |
 | `dead` drones pile up in `status` | directories outlive the sessions | `hive prune --dry-run`, then `hive prune` |
 | `hive revive` loses history | herdr integration missing | `herdr integration status` → must say `claude: current` |
 | drones bypass the mailbox | old spawn without the system prompt | kill and spawn anew |

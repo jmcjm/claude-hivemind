@@ -156,13 +156,17 @@ pane_status() {
   echo "$out" | jqp "p=r.get('pane',r); print(p.get('agent_status') or 'unknown')" || echo dead
 }
 
-# Is the pane stuck on a Claude Code dialog (trust / permission / choice)?
+# Is the pane stuck on a Claude Code dialog (trust / permission / resume / choice)?
+# 'resume' is the one a drone hits on its own: when its session runs out of context and is
+# resumed, Claude Code asks whether to continue from a summary or replay the full session,
+# and the drone sits there until somebody answers.
 pane_dialog() {
   local pane="$1" txt
   txt=$(herdr pane read "$pane" --source visible --lines 30 2>/dev/null) || return 1
   case "$txt" in
     *"trust this folder"*)        echo trust ;;
     *"Yes, I accept"*)            echo consent ;;
+    *"Resume from summary"*)      echo resume ;;
     *"Do you want to proceed"*)   echo permission ;;
     *"requires approval"*)        echo permission ;;
     *) return 1 ;;
@@ -699,6 +703,45 @@ d=json.load(open(p)); d['name']='$new'; json.dump(d,open(p,'w'),indent=1)"
   echo "rename: $old -> $new"
 }
 
+cmd_unblock() {  # unblock <name> — answers the dialog a drone is stuck on
+  local name="${1:?usage: hive unblock <name>}"
+  local pane; pane=$(pane_of "$name") || die "unknown drone: $name"
+  local dlg; dlg=$(pane_dialog "$pane" 2>/dev/null) || dlg=""
+  case "$dlg" in
+    resume)
+      # The recommended option ("Resume from summary") is the preselected one, so Enter takes it.
+      # Replaying the full session instead would burn a large share of the usage limit for a drone
+      # that already lost the thread — the summary is what the swarm wants here.
+      herdr agent send-keys "$name" enter >/dev/null 2>&1 \
+        || die "unblock: could not send the key to $name" ;;
+    trust)
+      herdr agent send-keys "$name" enter >/dev/null 2>&1 \
+        || die "unblock: could not send the key to $name" ;;
+    consent)
+      # Option 2 = "Yes, I accept" — the same answer hive spawn gives at bootstrap.
+      herdr pane send-text "$pane" 2 >/dev/null 2>&1
+      sleep 1
+      herdr agent send-keys "$name" enter >/dev/null 2>&1 \
+        || die "unblock: could not send the key to $name" ;;
+    permission)
+      # A real decision, not a formality. Pressing Enter blind is exactly what the swarm's
+      # safeguards exist to prevent.
+      die "unblock: $name waits on a PERMISSION dialog — that is a decision, not a formality. Look first: hive peek $name" ;;
+    *)
+      echo "unblock: $name is not stuck on a dialog hive can answer (status: $(pane_status "$pane")) — nothing sent"
+      return 1 ;;
+  esac
+
+  local i
+  for i in $(seq 1 10); do
+    sleep 1
+    pane_dialog "$pane" >/dev/null 2>&1 \
+      || { echo "unblock: $name answered ($dlg dialog cleared, status: $(pane_status "$pane"))"; return 0; }
+  done
+  echo "unblock: $name still shows a dialog after answering — look: hive peek $name" >&2
+  return 1
+}
+
 cmd_revive() {  # revive <name> — resurrects a drone with its conversation history intact
   local name="${1:?usage: hive revive <name>}"
   local cwd; cwd=$(meta_get "$name" cwd) || die "unknown drone: $name"
@@ -810,6 +853,20 @@ cmd_sweep() {  # sweep — one reconciliation pass; safe to run any time, quiet 
     [ -f "$d/brief.md" ]  || continue   # no task assigned yet
     [ -f "$d/report.md" ] && continue   # task concluded
     st=$(pane_status "$(pane_of "$name")")
+    # A drone whose context ran out waits on the resume dialog. herdr may report that as
+    # blocked or merely idle, so the dialog itself decides — and the alert names the cure
+    # instead of leaving the coordinator to rediscover it every time.
+    local dlg=""
+    case "$st" in blocked|idle|done|unknown) dlg=$(pane_dialog "$(pane_of "$name")" 2>/dev/null) || dlg="" ;; esac
+    if [ "$dlg" = resume ]; then
+      if [ "${HIVE_SWEEP_AUTOUNBLOCK:-0}" = 1 ]; then
+        cmd_unblock "$name" >/dev/null 2>&1 \
+          && { echo "sweep: answered the resume dialog for $name"; continue; }
+      fi
+      sweep_alert "$name" resume "SWEEP: drone $name waits on the resume dialog" \
+        "Its context ran out and the session asks how to resume. Answer it: hive unblock $name"
+      continue
+    fi
     case "$st" in
       dead)
         sweep_alert "$name" dead "SWEEP: drone $name is dead, task unfinished" \
@@ -1003,6 +1060,7 @@ case "${1:-}" in
   prune)  shift; cmd_prune  "$@" ;;
   rename) shift; cmd_rename "$@" ;;
   revive) shift; cmd_revive "$@" ;;
+  unblock) shift; cmd_unblock "$@" ;;
   sweep)  shift; cmd_sweep  "$@" ;;
   gate)   shift; cmd_gate   "$@" ;;
   *) cat <<'EOF'
@@ -1025,6 +1083,7 @@ hive — command a swarm of Claude Code agents in herdr
   hive prune  [--purge] [--dry-run] [names]  clear out dead drones (archived unless --purge)
   hive rename <old> <new>            rename a drone and its workspace
   hive revive <name>                 resurrect a drone with its history (--resume)
+  hive unblock <name>                answer the dialog a drone is stuck on (resume/trust/consent)
   hive sweep                         reconciliation pass: retry lost wake-ups, surface silent drones
                                      (a systemd user timer runs it every 5 min — install.sh sets it up)
   hive gate   <enter|release|status|queue> [desc]  one exclusive machine window for full gates (flock-backed)
