@@ -30,6 +30,7 @@ hive peek   <name> [lines]         view of the drone's terminal
 hive kill   <name> [--purge]       kill a drone (--purge also deletes reports)
 hive rename <old> <new>            rename a drone and its workspace
 hive revive <name>                 resurrection with full conversation history (--resume)
+hive sweep                         reconciliation pass — retry lost wake-ups, surface silent drones
 ```
 
 Swarm data: `~/.herdr-hive/drones/<name>/` → `meta.json`, `brief.md`, `report.md`.
@@ -88,6 +89,13 @@ The reliability net behind the happy path:
   notification (rate-limited), because that is the one failure the swarm cannot heal itself.
 - **`hive coord` reports backlog** — taking over a swarm surfaces letters stranded by a dead
   predecessor immediately; `hive status` prints an unread-mail line for the same reason.
+- **Reconciliation sweep** — a systemd user timer (installed by `install.sh`) runs `hive sweep`
+  every 5 minutes: it retries lost wake-ups (including failed ssh forwards to a remote
+  coordinator), raises a desktop reminder when coord mail sits unread past `HIVE_MAIL_OVERDUE`
+  (default 30 min), and mails coord about drones silent with a task in flight — dead, blocked,
+  idle without a report, or working past `HIVE_WORKING_WARN` (default 60 min). Alerts re-fire
+  at most every `HIVE_SWEEP_RENOTIFY` (default 30 min); `hive kill` marks the drone concluded
+  so its corpse stops alarming, and a new spawn/task resets the verdicts.
 
 `hive say` is your channel to a drone (prompt injection). Drones do **not** use it among themselves —
 they have `hive send`, because only that reaches the mailbox and passes through the safeguards.
@@ -233,6 +241,7 @@ that is long, resumable, and observable by the user.
 | drone `idle`, no report | considered the task done without writing | `hive say <drone> "write the report to <path>"` |
 | trust dialog on a new `--cwd` | folder untrusted in `~/.claude.json` | `hive spawn` handles it itself; if stubborn, `peek` + enter |
 | first-run dialog in swarm mode | first spawn on a fresh machine | `hive spawn` handles it itself, like the trust dialog |
+| swarm stands still, no mail at all | drone hook failed, or drone hung/died mid-turn | the sweep mails coord within ~5 min (`SWEEP: ...`); impatient? `hive sweep` by hand, then `hive peek` |
 
 ## herdr technicalities (0.8.2)
 

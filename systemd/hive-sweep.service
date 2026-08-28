@@ -1,0 +1,9 @@
+[Unit]
+Description=hivemind reconciliation sweep — retry lost wake-ups, surface silent drones
+
+[Service]
+Type=oneshot
+# systemd user sessions get a bare PATH; hive and herdr usually live outside it
+# (~/.local/bin, linuxbrew). Extend here if your herdr lives elsewhere.
+Environment=PATH=%h/.local/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.claude/skills/hivemind/hive sweep

@@ -12,7 +12,7 @@ ok()   { echo "  ✓ $*"; }
 warn() { echo "  ! $*" >&2; }
 die()  { echo "ERROR: $*" >&2; exit 1; }
 
-echo "== 1/7 Requirements =="
+echo "== 1/8 Requirements =="
 command -v herdr  >/dev/null || die "herdr missing — install from https://herdr.dev and rerun"
 command -v claude >/dev/null || die "claude missing (Claude Code CLI)"
 command -v python3 >/dev/null || die "python3 missing"
@@ -26,7 +26,7 @@ case "$HERDR_MAJOR_MINOR" in
   *)   warn "tested on herdr 0.8.x — on another version check the 'herdr technicalities' section in SKILL.md" ;;
 esac
 
-echo "== 2/7 Skill files =="
+echo "== 2/8 Skill files =="
 mkdir -p "$SKILL_DST"
 for f in hive drone-ping.sh coord-mail-check.sh drone-settings.json SKILL.md; do
   if [ -e "$SKILL_DST/$f" ] && ! cmp -s "$SRC/skill/$f" "$SKILL_DST/$f"; then
@@ -38,7 +38,7 @@ done
 chmod +x "$SKILL_DST/hive" "$SKILL_DST/drone-ping.sh" "$SKILL_DST/coord-mail-check.sh"
 ok "skill in $SKILL_DST"
 
-echo "== 3/7 hive in PATH =="
+echo "== 3/8 hive in PATH =="
 mkdir -p "$BIN_DST"
 ln -sf "$SKILL_DST/hive" "$BIN_DST/hive"
 ok "symlink $BIN_DST/hive"
@@ -47,7 +47,7 @@ case ":$PATH:" in
   *) warn "$BIN_DST is NOT in PATH — add to ~/.zshrc: export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
 esac
 
-echo "== 4/7 herdr ↔ Claude Code integration =="
+echo "== 4/8 herdr ↔ Claude Code integration =="
 # The SessionStart hook reports session_id and transcript to herdr — without it `hive revive` does not work.
 [ -f "$HOME/.claude/settings.json" ] && cp "$HOME/.claude/settings.json" "$HOME/.claude/settings.json.bak-$STAMP"
 herdr integration install claude >/dev/null 2>&1 || die "herdr integration install claude failed"
@@ -55,7 +55,7 @@ herdr integration status 2>/dev/null | grep -q '^claude: current' \
   && ok "claude integration active (settings.json backup: settings.json.bak-$STAMP)" \
   || die "claude integration does not report as active"
 
-echo "== 5/7 Coordinator Stop hook =="
+echo "== 5/8 Coordinator Stop hook =="
 # The level-triggered backstop for lost wake-ups: the registered coordinator session
 # cannot end a turn while unread mail sits in mail/coord. The hook self-scopes to the
 # coord.pane session (drones and unrelated sessions exit instantly), so it is safe
@@ -89,7 +89,24 @@ case "$HOOK_RESULT" in
   present) ok "Stop hook already present — skipping" ;;
 esac
 
-echo "== 6/7 CLAUDE.md entry =="
+echo "== 6/8 Reconciliation sweep timer =="
+# The wake-up path is event-driven and every event can be lost; `hive sweep` is the
+# level-triggered floor (retries lost wake-ups, reminds about overdue mail, surfaces
+# silent drones). A systemd user timer runs it every 5 minutes.
+if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
+  mkdir -p "$HOME/.config/systemd/user"
+  cp "$SRC/systemd/hive-sweep.service" "$SRC/systemd/hive-sweep.timer" "$HOME/.config/systemd/user/"
+  systemctl --user daemon-reload
+  if systemctl --user enable --now hive-sweep.timer >/dev/null 2>&1; then
+    ok "hive-sweep.timer active (every 5 min)"
+  else
+    warn "could not enable hive-sweep.timer — run: systemctl --user enable --now hive-sweep.timer"
+  fi
+else
+  warn "no systemd user session — schedule '$SKILL_DST/hive sweep' yourself (cron: */5 * * * *)"
+fi
+
+echo "== 7/8 CLAUDE.md entry =="
 CMD_FILE="$HOME/.claude/CLAUDE.md"
 MARKER="## Hivemind — commanding a swarm of agents in herdr"
 MARKER_PL="## Hivemind — dowodzenie rojem agentów w herdr"   # pre-translation installs
@@ -101,7 +118,7 @@ else
   ok "Hivemind section appended to $CMD_FILE"
 fi
 
-echo "== 7/7 Verification =="
+echo "== 8/8 Verification =="
 bash -n "$SKILL_DST/hive"                || die "hive: syntax error"
 bash -n "$SKILL_DST/drone-ping.sh"       || die "drone-ping.sh: syntax error"
 bash -n "$SKILL_DST/coord-mail-check.sh" || die "coord-mail-check.sh: syntax error"

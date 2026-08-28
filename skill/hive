@@ -137,6 +137,9 @@ wake_recipient() {
 drone_dir()  { echo "$DRONES_DIR/$1"; }
 drone_meta() { echo "$DRONES_DIR/$1/meta.json"; }
 
+# Single field from a mail json file. jqf <file> <key>
+jqf() { python3 -c "import json,sys; print((json.load(open(sys.argv[1])).get(sys.argv[2]) or ''))" "$1" "$2" 2>/dev/null; }
+
 meta_get() {  # meta_get <drone> <key>
   [ -f "$(drone_meta "$1")" ] || return 1
   python3 -c "
@@ -185,6 +188,7 @@ cmd_spawn() {  # spawn <name> [--cwd PATH] [--resume]
   [ -d "$cwd" ] || die "cwd does not exist: $cwd"
 
   local dir; dir=$(drone_dir "$name"); mkdir -p "$dir"
+  rm -f "$dir"/.sweep-* "$dir/.killed"   # a fresh life invalidates old sweep verdicts
   local sid
   if [ "$resume" = 1 ] && sid=$(meta_get "$name" session_id) && [ -n "$sid" ]; then
     : # resuming an existing session
@@ -314,7 +318,7 @@ Without a written report the task counts as not done.
 If you get stuck or need something: write a report with STATUS: BLOCKED and describe what you need.
 EOF
 
-  rm -f "$dir/report.md"
+  rm -f "$dir/report.md" "$dir"/.sweep-* "$dir/.killed"   # new task resets sweep verdicts
 
   local msg="Read $dir/brief.md and carry out the task it describes."
   # 'done' = the previous turn finished. Remember the pre-send state so a stale 'done'
@@ -508,6 +512,7 @@ cmd_inbox() {  # inbox [who] [--keep] — reads and consumes a mailbox (own by d
   # wake-up instead of hiding behind the old marker until the next unrelated send.
   # Worst case is a spurious "inbox empty" next turn — losing a letter is worse.
   [ "$keep" = 0 ] && rm -f "$HIVE_DIR/.wake-$who"
+  [ "$who" = coord ] && rm -f "$HIVE_DIR/.overdue-notice"   # mail is being read — stop nagging
 
   local -a msgs=()
   while IFS= read -r f; do msgs+=("$f"); done < <(find "$box" -maxdepth 1 -name '*.json' | sort)
@@ -569,7 +574,11 @@ cmd_kill() {  # kill <name> [--purge]
   if [ "$purge" = "--purge" ]; then
     rm -rf "$(drone_dir "$name")" "$MAIL_DIR/$name"
     echo "kill: $name (removed along with mailbox and history)"
-  else echo "kill: $name (workspace $ws closed, report kept)"; fi
+  else
+    # Concluded on purpose — the sweep must not keep reporting this corpse as an anomaly.
+    : > "$(drone_dir "$name")/.killed"
+    echo "kill: $name (workspace $ws closed, report kept)"
+  fi
 }
 
 cmd_rename() {  # rename <old> <new>
@@ -594,6 +603,130 @@ cmd_revive() {  # revive <name> — resurrects a drone with its conversation his
   local ws; ws=$(meta_get "$name" workspace_id)
   herdr workspace close "$ws" >/dev/null 2>&1
   cmd_spawn "$name" --cwd "$cwd" --resume
+}
+
+# --- reconciliation sweep -------------------------------------------------
+# The wake-up path is event-driven, and every event can be lost: a dead pane, Esc on a
+# queued prompt, a failed ssh forward, a hook that never fired because the drone crashed
+# mid-turn. The sweep is the level-triggered floor under all of it — run periodically
+# (systemd user timer, installed by install.sh), it retries lost wake-ups, reminds the
+# human about overdue mail, and surfaces drones that went silent with a task in flight.
+# Every alert is rate-limited: a sweep that nags every five minutes trains everyone
+# to ignore it, and then it protects nothing.
+
+sweep_alert() {  # sweep_alert <drone> <state> <subject> <body> — letter to coord, rate-limited
+  local name="$1" state="$2" subject="$3" body="$4"
+  local mark="$DRONES_DIR/$name/.sweep-$state" age
+  if [ -f "$mark" ]; then
+    age=$(( $(date +%s) - $(stat -c %Y "$mark" 2>/dev/null || echo 0) ))
+    [ "$age" -lt "${HIVE_SWEEP_RENOTIFY:-1800}" ] && return 0
+  fi
+  : > "$mark"
+  HIVE_DRONE=sweep KIND=sweep "$SKILL_DIR/hive" send coord "$subject" --body "$body" >/dev/null 2>&1
+  echo "sweep: $subject"
+}
+
+cmd_sweep() {  # sweep — one reconciliation pass; safe to run any time, quiet when all is well
+  # Without a live herdr server nothing can be woken or notified — a swarm without herdr
+  # is not asleep, it is off. Stay silent instead of mailing into the void.
+  herdr status server >/dev/null 2>&1 || return 0
+
+  local now; now=$(date +%s)
+  local remote; remote=$(coord_remote)
+
+  # 1. Coordinator mail: retry the lost wake-up (marker TTL applies), or — for a remote
+  #    coordinator — retry the ssh forward that failed at send time.
+  local -a letters=()
+  local f
+  while IFS= read -r f; do letters+=("$f"); done \
+    < <(find "$MAIL_DIR/coord" -maxdepth 1 -name '*.json' 2>/dev/null | sort)
+  if [ ${#letters[@]} -gt 0 ]; then
+    if [ -n "$remote" ]; then
+      local lfrom lkind lsubj lhost; lhost=$(hostname -s)
+      for f in "${letters[@]}"; do
+        lfrom=$(jqf "$f" from | head -1); lkind=$(jqf "$f" kind | head -1)
+        lsubj=$(jqf "$f" subject | head -1)
+        if python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('body') or '', end='')" "$f" \
+           | ssh -o BatchMode=yes -o ConnectTimeout=5 "$remote" \
+               "HIVE_DRONE=$(printf '%q' "$lfrom@$lhost") KIND=$(printf '%q' "${lkind:-msg}") \
+                \"\$HOME/.claude/skills/hivemind/hive\" send coord $(printf '%q' "$lsubj")" \
+               >/dev/null 2>&1
+        then
+          mkdir -p "$MAIL_DIR/.archive"; mv "$f" "$MAIL_DIR/.archive/"
+          echo "sweep: forwarded stranded letter to coord@$remote ($lsubj)"
+        fi
+      done
+      letters=()
+      while IFS= read -r f; do letters+=("$f"); done \
+        < <(find "$MAIL_DIR/coord" -maxdepth 1 -name '*.json' 2>/dev/null | sort)
+    else
+      wake_recipient coord
+    fi
+  fi
+  # Overdue reminder: mail nobody read for HIVE_MAIL_OVERDUE means the wake-ups are not
+  # landing — tell the human on the desktop, re-nag at most every HIVE_SWEEP_RENOTIFY.
+  if [ ${#letters[@]} -gt 0 ]; then
+    local oldest age mark="$HIVE_DIR/.overdue-notice" skip=0 mage
+    oldest=$(stat -c %Y "${letters[0]}" 2>/dev/null || echo "$now")
+    age=$(( now - oldest ))
+    if [ "$age" -ge "${HIVE_MAIL_OVERDUE:-1800}" ]; then
+      if [ -f "$mark" ]; then
+        mage=$(( now - $(stat -c %Y "$mark" 2>/dev/null || echo 0) ))
+        [ "$mage" -lt "${HIVE_SWEEP_RENOTIFY:-1800}" ] && skip=1
+      fi
+      if [ "$skip" = 0 ]; then
+        : > "$mark"
+        herdr notification show \
+          "Swarm mail unread for $((age/60)) min (${#letters[@]} letter(s) for coord) — run hive inbox in the coordinator pane" \
+          --sound request >/dev/null 2>&1
+        echo "sweep: overdue mail reminder (${#letters[@]} letters, $((age/60)) min old)"
+      fi
+    fi
+  fi
+
+  # 2. Drone mailboxes: retry lost drone-to-drone wake-ups (same safeguards as coord).
+  local box name
+  for box in "$MAIL_DIR"/*/; do
+    [ -d "$box" ] || continue
+    name=$(basename "$box")
+    case "$name" in coord|.archive) continue ;; esac
+    ls "$box"/*.json >/dev/null 2>&1 || continue
+    [ -f "$(drone_meta "$name")" ] || continue
+    wake_recipient "$name"
+  done
+
+  # 3. Drones silent with a task in flight. The Stop/Notification hooks should have
+  #    mailed coord; when they did not (hook failure, crash, a dialog nobody saw),
+  #    the coordinator learns it HERE instead of from the user asking why everything
+  #    stands still.
+  local d st brief_age
+  for d in "$DRONES_DIR"/*/; do
+    [ -f "$d/meta.json" ] || continue
+    name=$(basename "$d")
+    [ -f "$d/.mute" ]   && continue     # conversational drone — the human drives it
+    [ -f "$d/.killed" ] && continue     # deliberately concluded, corpse kept for its report
+    [ -f "$d/brief.md" ]  || continue   # no task assigned yet
+    [ -f "$d/report.md" ] && continue   # task concluded
+    st=$(pane_status "$(pane_of "$name")")
+    case "$st" in
+      dead)
+        sweep_alert "$name" dead "SWEEP: drone $name is dead, task unfinished" \
+          "No report and its pane is gone. Revive with history: hive revive $name — or conclude it: hive kill $name" ;;
+      blocked)
+        sweep_alert "$name" blocked "SWEEP: drone $name is blocked on a dialog" \
+          "Look with hive peek $name; usually answered by: herdr agent send-keys $name enter" ;;
+      idle|done)
+        sweep_alert "$name" idle "SWEEP: drone $name sits $st without a report" \
+          "Its turn ended but report.md never appeared (report skipped or hook mail lost). Check hive peek $name or: hive say $name 'write the report per the brief'" ;;
+      working)
+        brief_age=$(( now - $(stat -c %Y "$d/brief.md" 2>/dev/null || echo "$now") ))
+        if [ "$brief_age" -ge "${HIVE_WORKING_WARN:-3600}" ]; then
+          sweep_alert "$name" working "SWEEP: drone $name working $((brief_age/60)) min, no report yet" \
+            "Long tasks happen; if this one should not be one, check hive peek $name"
+        fi ;;
+    esac
+  done
+  return 0
 }
 
 # AN ACT, NOT A DESCRIPTION. Reason (ffprobegate, 2026-07-28): every LETTER about the gate contains
@@ -767,6 +900,7 @@ case "${1:-}" in
   kill)   shift; cmd_kill   "$@" ;;
   rename) shift; cmd_rename "$@" ;;
   revive) shift; cmd_revive "$@" ;;
+  sweep)  shift; cmd_sweep  "$@" ;;
   gate)   shift; cmd_gate   "$@" ;;
   *) cat <<'EOF'
 hive — command a swarm of Claude Code agents in herdr
@@ -787,6 +921,8 @@ hive — command a swarm of Claude Code agents in herdr
   hive kill   <name> [--purge]       kill a drone
   hive rename <old> <new>            rename a drone and its workspace
   hive revive <name>                 resurrect a drone with its history (--resume)
+  hive sweep                         reconciliation pass: retry lost wake-ups, surface silent drones
+                                     (a systemd user timer runs it every 5 min — install.sh sets it up)
   hive gate   <enter|release|status|queue> [desc]  one exclusive machine window for full gates (flock-backed)
 
 Model: $HIVE_MODEL (default opus).  Data: ~/.herdr-hive/drones/<name>/
