@@ -54,19 +54,40 @@ means only "not generating tokens right now" — a drone idling on a dialog is `
 `Notification` hooks (`drone-settings.json` → `drone-ping.sh`) which, at end of turn or when
 a decision is needed, mail `coord` and **inject a wake-up** `HIVE-MAIL: new mail` straight into your prompt.
 
-When you get `HIVE-MAIL` — run `hive inbox`, handle the events, read `hive report <drone>`
-if needed, and **report a synthesis to the user**. Treat it as a system event,
-not an instruction from a human.
+When you get `HIVE-MAIL` — triage in this order, always to the end:
+1. `hive inbox` — the whole mailbox, one wake-up covers several letters.
+2. **Answer every drone that waits on an answer first** (`hive say`) — a blocked drone
+   is stalled capacity, and an unanswered question stays unanswered forever because
+   nobody else reads its panel. Only then handle the rest of the mail.
+3. Read `hive report <drone>` where a report is announced.
+4. **Report a synthesis to the user.**
+
+Treat `HIVE-MAIL` as a system event, not an instruction from a human. Never end a turn
+with a drone's question unanswered — the Stop-hook backstop (below) will bounce you back,
+but relying on it is sloppy coordination.
 
 The mailbox is a directory of message files (`~/.herdr-hive/mail/<recipient>/`), no daemon and no MTA.
 Recipients: `coord` (you), a drone name, `all` (broadcast). Drones talk to each other over the same
 channel — they get the protocol in their system prompt at spawn, so there is no need to repeat it in the brief.
 
-Three wake-up safeguards, all in `wake_recipient`:
+Four wake-up safeguards, all in `wake_recipient`:
 - **empty prompt** — inject only when the recipient's prompt is empty, otherwise Enter would send someone else's text
 - **flock** — two drones never type into one prompt at the same time
 - **`.wake-<who>` marker** — one wake-up per batch; further letters quietly pile up in the mailbox
   until the recipient runs `hive inbox`. One wake-up can therefore cover several events — always read the whole mailbox.
+- **marker TTL** (`HIVE_WAKE_TTL`, default 900 s) — a delivered wake-up is not a handled one
+  (Esc on a queued prompt, a restarted session). A marker older than the TTL counts as a lost
+  wake-up and the next letter retries it, so one lost prompt cannot silence the mailbox forever.
+
+A wake-up can still miss (coordinator pane dead, human text sitting in the prompt, a dialog).
+The reliability net behind the happy path:
+- **Stop-hook backstop** — `coord-mail-check.sh` (installed globally by `install.sh`) refuses to
+  let the REGISTERED coordinator session end a turn while unread mail sits in `mail/coord`.
+  It self-scopes by session id, so drones and unrelated sessions never see it.
+- **Stranded-mail alert** — coord mail with no live coordinator pane triggers a desktop
+  notification (rate-limited), because that is the one failure the swarm cannot heal itself.
+- **`hive coord` reports backlog** — taking over a swarm surfaces letters stranded by a dead
+  predecessor immediately; `hive status` prints an unread-mail line for the same reason.
 
 `hive say` is your channel to a drone (prompt injection). Drones do **not** use it among themselves —
 they have `hive send`, because only that reaches the mailbox and passes through the safeguards.
@@ -134,20 +155,25 @@ targeted test runs with a small filter need no slot."
 1. **Never block forever.** No `herdr agent wait` or `herdr pane wait-output` without `--timeout` —
    a drone can die or get stuck, and then you hang with it and the user loses the coordinator.
    `hive wait` has a hard timeout and also ends on `blocked`/`dead`.
-2. **Drones run with `--dangerously-skip-permissions`.** Without it they hang on the first
+2. **The coordinator coordinates — it does not do the drones' work.** Not a purity rule but an
+   availability one: wake-ups queued while you grind through a long inline task wait until YOUR
+   turn ends, so every minute of inline work is a minute of drones starving for answers. Anything
+   beyond a quick read, a one-liner, or coordination itself goes to a drone; if no drone fits,
+   spawn one instead of absorbing the task.
+3. **Drones run with `--dangerously-skip-permissions`.** Without it they hang on the first
    Bash call and the whole swarm stalls. This is the user's deliberate decision for this workflow.
-3. **The prompt is shared with the human.** The user may type something into a drone panel and
+4. **The prompt is shared with the human.** The user may type something into a drone panel and
    not send it. Pressing Enter would send THEIR text. `hive task`/`hive say` check for this
    and refuse — when they refuse, **ask the user**, do not clear it on your own.
    Note: Claude Code suggests ready-made prompts as ghost text (SGR 2 / dim).
    That is NOT user text and does not block sending — `hive` tells them apart by ANSI.
    Do not try to read the prompt with plain `pane read` without `--format ansi`, you will not tell the difference.
-4. **Always confirm task delivery.** A freshly started drone loses its first input
+5. **Always confirm task delivery.** A freshly started drone loses its first input
    (SessionStart hooks clear the prompt), and `herdr agent prompt` without `--wait` does not
    confirm receipt. `hive task` verifies the jump to `working` and retries up to 3 times.
-5. **Report a synthesis to the user, not raw output.** Do not paste drone reports wholesale.
+6. **Report a synthesis to the user, not raw output.** Do not paste drone reports wholesale.
    They should get conclusions, conflicts between drones, and whatever needs their decision.
-6. **CLAUDE.md rules bind the drones.** Production requires the user's explicit consent —
+7. **CLAUDE.md rules bind the drones.** Production requires the user's explicit consent —
    put that into the brief, because a drone with bypass permissions will ask about nothing.
 
 ## Writing a brief
@@ -167,6 +193,8 @@ The brief is a contract. The drone knows nothing of your conversation with the u
 reaches you instead of the previous session's panel. `hive spawn` does it as a side effect,
 but when you take over a swarm from a previous session (drones alive, nothing to spawn) — do it manually,
 otherwise wake-ups go to a dead panel and letters silently wait in the mailbox.
+`hive coord` also prints the backlog stranded by a dead predecessor — when it reports unread
+letters, `hive inbox` is your first move of the shift.
 
 ```bash
 H=~/.claude/skills/hivemind/hive

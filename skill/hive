@@ -76,10 +76,31 @@ json.dump({'ts':time.strftime('%Y-%m-%d %H:%M:%S'),'from':frm,'to':to,
   mv "$tmp" "$box/$(date +%s%N)-$from.json"
 }
 
+# Desktop escalation for coord mail that has nobody to wake (no pane registered, or the
+# registered pane is gone). Without this the letters wait in silence with no retry in
+# sight — the one failure the swarm cannot heal on its own, so the human gets a ping.
+# Rate-limited by a marker so a burst of drone hooks does not fire one ping per letter.
+coord_stranded_notice() {
+  local mark="$HIVE_DIR/.stranded-notice" age n
+  if [ -f "$mark" ]; then
+    age=$(( $(date +%s) - $(stat -c %Y "$mark" 2>/dev/null || echo 0) ))
+    [ "$age" -lt 900 ] && return 0
+  fi
+  : > "$mark"
+  n=$(find "$MAIL_DIR/coord" -maxdepth 1 -name '*.json' 2>/dev/null | wc -l)
+  herdr notification show \
+    "Swarm mail STRANDED: no live coordinator pane ($n letters waiting). In a coordinator session run: hive coord && hive inbox" \
+    --sound request >/dev/null 2>&1
+}
+
 # Wakes the recipient by injecting a message into their prompt. Safeguards:
 #  - only when the recipient's prompt is EMPTY (never overwrite a human's text)
 #  - flock: two drones never write into one prompt at the same time
 #  - marker: one wake-up per batch, until the recipient runs 'hive inbox'
+#  - marker TTL: a delivered wake-up is not a handled one (Esc, a restarted session,
+#    mail read without 'hive inbox') — a marker older than HIVE_WAKE_TTL (default 900 s)
+#    counts as a LOST wake-up and is retried; without the TTL one lost prompt would
+#    silence the mailbox forever
 wake_recipient() {
   local who="$1" pane=""
   if [ "$who" = coord ]; then
@@ -87,19 +108,30 @@ wake_recipient() {
     # (cmd_send forwards over ssh; this path only runs when that forward failed).
     [ -n "$(coord_remote)" ] && return 0
     pane=$(coord_pane)
-  else pane=$(pane_of "$who" 2>/dev/null); fi
-  [ -n "$pane" ] || return 0
+    [ -n "$pane" ] || { coord_stranded_notice; return 0; }
+  else
+    pane=$(pane_of "$who" 2>/dev/null)
+    [ -n "$pane" ] || return 0
+  fi
 
   exec 9>"$HIVE_DIR/.wake-lock"
   flock -w 15 9 || return 0
-  [ -f "$HIVE_DIR/.wake-$who" ] && return 0        # already woken, do not spam
-  case "$(pane_status "$pane")" in dead|blocked) return 0 ;; esac
+  local mark="$HIVE_DIR/.wake-$who" age
+  if [ -f "$mark" ]; then
+    age=$(( $(date +%s) - $(stat -c %Y "$mark" 2>/dev/null || echo 0) ))
+    [ "$age" -lt "${HIVE_WAKE_TTL:-900}" ] && return 0   # already woken, do not spam
+    rm -f "$mark"                                        # stale — retry the wake-up
+  fi
+  case "$(pane_status "$pane")" in
+    dead)    [ "$who" = coord ] && coord_stranded_notice; return 0 ;;
+    blocked) return 0 ;;
+  esac
   [ -n "$(prompt_pending "$pane")" ] && return 0   # human is typing — leave it, mail can wait
 
   # herdr 0.8: agent prompt appends Enter itself and honors bracketed-paste; for a recipient
   # mid-turn Claude Code queues the message, and one stuck at a dialog is rejected (agent_blocked).
   herdr agent prompt "$pane" "HIVE-MAIL: new mail. Run: hive inbox" >/dev/null 2>&1 || return 0
-  : > "$HIVE_DIR/.wake-$who"
+  : > "$mark"
 }
 
 drone_dir()  { echo "$DRONES_DIR/$1"; }
@@ -167,7 +199,10 @@ cmd_spawn() {  # spawn <name> [--cwd PATH] [--resume]
   # Spawning from a local pane makes THIS pane the coordinator — a stale remote marker
   # would silently divert the fleet's mail to another machine. Over ssh there is no
   # calling pane, so a remote coordinator's registration survives untouched.
-  [ -n "$coord" ] && { echo "$coord" > "$HIVE_DIR/coord.pane"; rm -f "$HIVE_DIR/coord.remote"; }
+  # The wake-up marker aimed at the PREVIOUS coordinator pane dies with the takeover,
+  # otherwise it would gag the new pane's first wake-up until the TTL expired.
+  [ -n "$coord" ] && { echo "$coord" > "$HIVE_DIR/coord.pane"
+                       rm -f "$HIVE_DIR/coord.remote" "$HIVE_DIR/.wake-coord" "$HIVE_DIR/.stranded-notice"; }
 
   # 1 workspace per drone, label = drone name. Swarm environment variables enter here —
   # herdr 0.8 injects --env into the root pane shell, and agent start has no --env at all.
@@ -352,6 +387,11 @@ Not sending — Enter would send THAT. Sort the prompt out (hive clear $name) an
 }
 
 cmd_status() {  # status [name...] — never blocks
+  # Passive reconciliation surface: status gets run often, so unread mail that lost its
+  # wake-up (dead pane, human text in the prompt) resurfaces here instead of rotting.
+  local me="${HIVE_DRONE:-coord}" nmail
+  nmail=$(find "$MAIL_DIR/$me" -maxdepth 1 -name '*.json' 2>/dev/null | wc -l)
+  [ "$nmail" -gt 0 ] && echo "mail ($me): $nmail unread letter(s) — run: hive inbox"
   local names=()
   if [ $# -gt 0 ]; then names=("$@"); else
     for d in "$DRONES_DIR"/*/; do [ -d "$d" ] && names+=("$(basename "$d")"); done
@@ -464,6 +504,11 @@ cmd_inbox() {  # inbox [who] [--keep] — reads and consumes a mailbox (own by d
   local box="$MAIL_DIR/$who"
   mkdir -p "$box"
 
+  # Release the wake-up BEFORE scanning: a letter landing while we read gets a fresh
+  # wake-up instead of hiding behind the old marker until the next unrelated send.
+  # Worst case is a spurious "inbox empty" next turn — losing a letter is worse.
+  [ "$keep" = 0 ] && rm -f "$HIVE_DIR/.wake-$who"
+
   local -a msgs=()
   while IFS= read -r f; do msgs+=("$f"); done < <(find "$box" -maxdepth 1 -name '*.json' | sort)
   if [ ${#msgs[@]} -eq 0 ]; then
@@ -486,7 +531,6 @@ for p in sys.argv[1:]:
   if [ "$keep" = 0 ]; then
     mkdir -p "$MAIL_DIR/.archive"
     mv "${msgs[@]}" "$MAIL_DIR/.archive/" 2>/dev/null
-    rm -f "$HIVE_DIR/.wake-$who"   # release the wake-up — the next batch may wake again
   fi
 }
 
@@ -697,15 +741,22 @@ case "${1:-}" in
   send)   shift; cmd_send   "$@" ;;
   inbox)  shift; cmd_inbox  "$@" ;;
   coord)  shift
+          # Either branch is a coordinator handover: wake-up state aimed at the previous
+          # coordinator dies with it, and the new one learns about backlog immediately —
+          # letters stranded by a dead predecessor surface here, not at the next send.
           if [ "${1:-}" = --remote ]; then
             [ -n "${2:-}" ] || die "usage: hive coord --remote <ssh-host>"
             printf '%s\n' "$2" > "$HIVE_DIR/coord.remote"
-            rm -f "$HIVE_DIR/coord.pane"
+            rm -f "$HIVE_DIR/coord.pane" "$HIVE_DIR/.wake-coord" "$HIVE_DIR/.stranded-notice"
             echo "coord: remote at $2 — coord mail is forwarded over ssh"
           else
-            rm -f "$HIVE_DIR/coord.remote"
+            rm -f "$HIVE_DIR/coord.remote" "$HIVE_DIR/.wake-coord" "$HIVE_DIR/.stranded-notice"
             herdr pane current --current 2>/dev/null | jqp "print(r['pane']['pane_id'])" > "$HIVE_DIR/coord.pane"
             echo "coord: $(coord_pane)"
+          fi
+          backlog=$(find "$MAIL_DIR/coord" -maxdepth 1 -name '*.json' 2>/dev/null | wc -l)
+          if [ "$backlog" -gt 0 ]; then
+            echo "coord: $backlog unread letter(s) waiting — run: hive inbox"
           fi ;;
   _pending) shift; prompt_pending "${1:?missing pane}" ;;   # internal, for drone-ping.sh
   status) shift; cmd_status "$@" ;;

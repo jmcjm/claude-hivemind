@@ -12,7 +12,7 @@ ok()   { echo "  ✓ $*"; }
 warn() { echo "  ! $*" >&2; }
 die()  { echo "ERROR: $*" >&2; exit 1; }
 
-echo "== 1/6 Requirements =="
+echo "== 1/7 Requirements =="
 command -v herdr  >/dev/null || die "herdr missing — install from https://herdr.dev and rerun"
 command -v claude >/dev/null || die "claude missing (Claude Code CLI)"
 command -v python3 >/dev/null || die "python3 missing"
@@ -26,19 +26,19 @@ case "$HERDR_MAJOR_MINOR" in
   *)   warn "tested on herdr 0.8.x — on another version check the 'herdr technicalities' section in SKILL.md" ;;
 esac
 
-echo "== 2/6 Skill files =="
+echo "== 2/7 Skill files =="
 mkdir -p "$SKILL_DST"
-for f in hive drone-ping.sh drone-settings.json SKILL.md; do
+for f in hive drone-ping.sh coord-mail-check.sh drone-settings.json SKILL.md; do
   if [ -e "$SKILL_DST/$f" ] && ! cmp -s "$SRC/skill/$f" "$SKILL_DST/$f"; then
     cp "$SKILL_DST/$f" "$SKILL_DST/$f.bak-$STAMP"
     warn "existing $f archived as $f.bak-$STAMP"
   fi
   cp "$SRC/skill/$f" "$SKILL_DST/$f"
 done
-chmod +x "$SKILL_DST/hive" "$SKILL_DST/drone-ping.sh"
+chmod +x "$SKILL_DST/hive" "$SKILL_DST/drone-ping.sh" "$SKILL_DST/coord-mail-check.sh"
 ok "skill in $SKILL_DST"
 
-echo "== 3/6 hive in PATH =="
+echo "== 3/7 hive in PATH =="
 mkdir -p "$BIN_DST"
 ln -sf "$SKILL_DST/hive" "$BIN_DST/hive"
 ok "symlink $BIN_DST/hive"
@@ -47,7 +47,7 @@ case ":$PATH:" in
   *) warn "$BIN_DST is NOT in PATH — add to ~/.zshrc: export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
 esac
 
-echo "== 4/6 herdr ↔ Claude Code integration =="
+echo "== 4/7 herdr ↔ Claude Code integration =="
 # The SessionStart hook reports session_id and transcript to herdr — without it `hive revive` does not work.
 [ -f "$HOME/.claude/settings.json" ] && cp "$HOME/.claude/settings.json" "$HOME/.claude/settings.json.bak-$STAMP"
 herdr integration install claude >/dev/null 2>&1 || die "herdr integration install claude failed"
@@ -55,7 +55,41 @@ herdr integration status 2>/dev/null | grep -q '^claude: current' \
   && ok "claude integration active (settings.json backup: settings.json.bak-$STAMP)" \
   || die "claude integration does not report as active"
 
-echo "== 5/6 CLAUDE.md entry =="
+echo "== 5/7 Coordinator Stop hook =="
+# The level-triggered backstop for lost wake-ups: the registered coordinator session
+# cannot end a turn while unread mail sits in mail/coord. The hook self-scopes to the
+# coord.pane session (drones and unrelated sessions exit instantly), so it is safe
+# to install into the user's global settings.
+SETTINGS="$HOME/.claude/settings.json"
+[ -f "$SETTINGS" ] && cp "$SETTINGS" "$SETTINGS.bak-hook-$STAMP"
+HOOK_RESULT=$(python3 - "$SETTINGS" <<'PY'
+import json, os, sys
+path = sys.argv[1]
+cmd = 'bash "$HOME/.claude/skills/hivemind/coord-mail-check.sh"'
+data = {}
+if os.path.exists(path):
+    with open(path) as f:
+        data = json.load(f)
+stop = data.setdefault("hooks", {}).setdefault("Stop", [])
+present = any(h.get("command") == cmd
+              for grp in stop for h in grp.get("hooks", []))
+if present:
+    print("present")
+else:
+    stop.append({"matcher": "*",
+                 "hooks": [{"type": "command", "timeout": 15, "command": cmd}]})
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    print("added")
+PY
+) || die "failed to update $SETTINGS (backup: $SETTINGS.bak-hook-$STAMP)"
+case "$HOOK_RESULT" in
+  added)   ok "Stop hook added to $SETTINGS (backup: settings.json.bak-hook-$STAMP)" ;;
+  present) ok "Stop hook already present — skipping" ;;
+esac
+
+echo "== 6/7 CLAUDE.md entry =="
 CMD_FILE="$HOME/.claude/CLAUDE.md"
 MARKER="## Hivemind — commanding a swarm of agents in herdr"
 MARKER_PL="## Hivemind — dowodzenie rojem agentów w herdr"   # pre-translation installs
@@ -67,9 +101,10 @@ else
   ok "Hivemind section appended to $CMD_FILE"
 fi
 
-echo "== 6/6 Verification =="
-bash -n "$SKILL_DST/hive"           || die "hive: syntax error"
-bash -n "$SKILL_DST/drone-ping.sh"  || die "drone-ping.sh: syntax error"
+echo "== 7/7 Verification =="
+bash -n "$SKILL_DST/hive"                || die "hive: syntax error"
+bash -n "$SKILL_DST/drone-ping.sh"       || die "drone-ping.sh: syntax error"
+bash -n "$SKILL_DST/coord-mail-check.sh" || die "coord-mail-check.sh: syntax error"
 python3 -c "import json;json.load(open('$SKILL_DST/drone-settings.json'))" || die "drone-settings.json: invalid JSON"
 "$SKILL_DST/hive" >/dev/null        || die "hive does not start"
 ok "syntax and JSON valid"

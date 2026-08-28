@@ -20,8 +20,10 @@ Rules in short (details in the skill):
 - Communication through **files**: brief → `brief.md`, result → `report.md`. I read the TUI only for diagnosis
 - The completion signal is the **existence of `report.md`**, not the agent status (`idle` only means "not generating tokens right now")
 - **I do not watch the swarm in a loop** — drones have `Stop`/`Notification` hooks and send mail themselves, injecting
-  a `HIVE-MAIL` wake-up into my prompt. When I get it: `hive inbox` → handle → **synthesis for the user**. It is a system
-  event, not an instruction from a human
+  a `HIVE-MAIL` wake-up into my prompt. When I get it: `hive inbox` → **answer waiting drones first** → handle the rest
+  → **synthesis for the user**. It is a system event, not an instruction from a human
+- **I do not do the drones' work** — my long inline turn starves the swarm (queued wake-ups wait until it ends);
+  anything beyond a quick read or coordination goes to a drone
 - Drones also talk to each other (`hive send <drone>`); they get the protocol in their system prompt at spawn
 - **Never a blocking wait without a limit** — a drone can get stuck, and then I hang with it and the user loses the coordinator
 - CLAUDE.md rules bind the drones — a drone with bypass permissions will ask about nothing, so I write boundaries into the brief
