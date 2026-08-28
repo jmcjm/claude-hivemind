@@ -169,6 +169,46 @@ pane_dialog() {
   esac
 }
 
+# Status of a drone by NAME, not by pane. A directory left over from a drone whose meta.json
+# is gone has no pane at all — that is the archetypal ghost, and it counts as dead.
+drone_state() {
+  local pane; pane=$(pane_of "$1" 2>/dev/null) || { echo dead; return; }
+  [ -n "$pane" ] || { echo dead; return; }
+  pane_status "$pane"
+}
+
+# --- archive --------------------------------------------------------------
+# Reports are evidence. Nothing removes a drone directory without a copy landing here first,
+# unless the caller explicitly asks for a hard delete (--purge).
+
+# hive_archive <label> <name>... — packs the drones' directories + mailboxes into one tarball.
+# Prints the archive path on success; returns non-zero when there was nothing to pack or tar failed.
+hive_archive() {
+  local label="$1"; shift
+  local adir="$HIVE_DIR/archive"; mkdir -p "$adir" || return 1
+  local base="$adir/$label-$(date +%Y%m%d-%H%M%S)"
+  # Two archives in the same second must not overwrite each other — the second one would
+  # silently destroy the evidence the first one had just rescued.
+  local out="$base.tar.gz" i=2
+  while [ -e "$out" ]; do out="$base-$i.tar.gz"; i=$((i+1)); done
+  local -a paths=(); local n
+  for n in "$@"; do
+    [ -d "$DRONES_DIR/$n" ] && paths+=("drones/$n")
+    [ -d "$MAIL_DIR/$n" ]   && paths+=("mail/$n")
+  done
+  [ ${#paths[@]} -gt 0 ] || return 1
+  # Paths relative to $HIVE_DIR, so the tarball unpacks straight back over the hive directory.
+  tar -czf "$out" -C "$HIVE_DIR" "${paths[@]}" 2>/dev/null || { rm -f "$out"; return 1; }
+  printf '%s\n' "$out"
+}
+
+# drone_remove <name> — the directory, the mailbox and the wake-up marker. No archiving here:
+# the caller decides that, and it must have happened BEFORE this runs.
+drone_remove() {
+  rm -rf "$(drone_dir "$1")" "$MAIL_DIR/$1"
+  rm -f "$HIVE_DIR/.wake-$1"
+}
+
 # --- commands -------------------------------------------------------------
 
 cmd_spawn() {  # spawn <name> [--cwd PATH] [--resume]
@@ -568,17 +608,79 @@ cmd_mute() {  # mute <name> [--off] — silences the drone's automatic wake-ups
 
 cmd_kill() {  # kill <name> [--purge]
   local name="${1:?usage: hive kill <name> [--purge]}"; local purge="${2:-}"
-  local ws; ws=$(meta_get "$name" workspace_id) || die "unknown drone: $name"
-  herdr workspace close "$ws" >/dev/null 2>&1
+  local dir; dir=$(drone_dir "$name")
+  [ -d "$dir" ] || die "unknown drone: $name"
+  # The state is read BEFORE the workspace is closed — afterwards every drone looks dead,
+  # and the difference between "killed just now" and "was already a corpse" would be lost.
+  local state; state=$(drone_state "$name")
+  # A directory without meta.json has no workspace to close; that is not a reason to refuse.
+  local ws; ws=$(meta_get "$name" workspace_id) || ws=""
+  [ -n "$ws" ] && herdr workspace close "$ws" >/dev/null 2>&1
   rm -f "$HIVE_DIR/.wake-$name"
+
   if [ "$purge" = "--purge" ]; then
-    rm -rf "$(drone_dir "$name")" "$MAIL_DIR/$name"
+    drone_remove "$name"
     echo "kill: $name (removed along with mailbox and history)"
-  else
-    # Concluded on purpose — the sweep must not keep reporting this corpse as an anomaly.
-    : > "$(drone_dir "$name")/.killed"
-    echo "kill: $name (workspace $ws closed, report kept)"
+    return
   fi
+  if [ "$state" = dead ]; then
+    # Killing a corpse used to leave the directory behind, so the drone kept haunting
+    # 'hive status' forever. Consistent with prune: archive, then remove. No .killed marker
+    # is needed here — the sweep cannot report a drone whose directory is gone.
+    local arch
+    if arch=$(hive_archive "kill-$name" "$name"); then
+      drone_remove "$name"
+      echo "kill: $name was already dead — archived to $arch and removed"
+    else
+      die "kill: $name is dead but archiving failed — nothing removed"
+    fi
+    return
+  fi
+  # Concluded on purpose — the sweep must not keep reporting this corpse as an anomaly.
+  # The directory stays: killing a LIVING drone is usually done for its report.
+  : > "$(drone_dir "$name")/.killed"
+  echo "kill: $name (workspace $ws closed, report kept)"
+}
+
+cmd_prune() {  # prune [--purge] [--dry-run] [name...] — clears out dead drones
+  local purge=0 dry=0 names=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --purge)   purge=1; shift ;;
+      --dry-run) dry=1; shift ;;
+      -*) die "unknown argument: $1" ;;
+      *) names+=("$1"); shift ;;
+    esac
+  done
+  if [ ${#names[@]} -eq 0 ]; then
+    for d in "$DRONES_DIR"/*/; do [ -d "$d" ] && names+=("$(basename "$d")"); done
+  fi
+  [ ${#names[@]} -eq 0 ] && { echo "prune: no drones"; return; }
+
+  # Living drones are never touched — not even a blocked one, which is stuck rather than gone.
+  local dead=() n st
+  for n in "${names[@]}"; do
+    [ -d "$(drone_dir "$n")" ] || { echo "prune: unknown drone: $n" >&2; continue; }
+    st=$(drone_state "$n")
+    if [ "$st" = dead ]; then dead+=("$n"); else echo "prune: keeping $n ($st)"; fi
+  done
+  [ ${#dead[@]} -eq 0 ] && { echo "prune: nothing to prune (0 dead drones)"; return; }
+
+  if [ "$dry" = 1 ]; then
+    printf 'prune: would remove %d dead drone(s)%s:\n' "${#dead[@]}" \
+           "$([ "$purge" = 1 ] && echo ' without archiving' || echo ' after archiving')"
+    printf '  %s\n' "${dead[@]}"
+    return
+  fi
+
+  local arch=""
+  if [ "$purge" = 0 ]; then
+    arch=$(hive_archive prune "${dead[@]}") \
+      || die "prune: archiving failed — nothing removed (use --purge to delete without an archive)"
+  fi
+  for n in "${dead[@]}"; do drone_remove "$n"; done
+  printf 'prune: removed %d dead drone(s): %s\n' "${#dead[@]}" "${dead[*]}"
+  [ -n "$arch" ] && echo "prune: archive $arch"
 }
 
 cmd_rename() {  # rename <old> <new>
@@ -898,6 +1000,7 @@ case "${1:-}" in
   mute)   shift; cmd_mute   "$@" ;;
   peek)   shift; cmd_peek   "$@" ;;
   kill)   shift; cmd_kill   "$@" ;;
+  prune)  shift; cmd_prune  "$@" ;;
   rename) shift; cmd_rename "$@" ;;
   revive) shift; cmd_revive "$@" ;;
   sweep)  shift; cmd_sweep  "$@" ;;
@@ -918,7 +1021,8 @@ hive — command a swarm of Claude Code agents in herdr
   hive report <name>                 show a drone's report
   hive mute   <name> [--off]         silence automatic wake-ups (conversational drone)
   hive peek   <name> [lines]         view of the drone's terminal
-  hive kill   <name> [--purge]       kill a drone
+  hive kill   <name> [--purge]       kill a drone (a dead one is archived and removed)
+  hive prune  [--purge] [--dry-run] [names]  clear out dead drones (archived unless --purge)
   hive rename <old> <new>            rename a drone and its workspace
   hive revive <name>                 resurrect a drone with its history (--resume)
   hive sweep                         reconciliation pass: retry lost wake-ups, surface silent drones

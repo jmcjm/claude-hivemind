@@ -44,7 +44,7 @@ in the coordinator's prompt on its own. Then:
 ```bash
 hive inbox                      # -> a [finished] entry from drone "testdrone"
 hive report testdrone           # -> STATUS: DONE + content
-hive kill testdrone --purge
+hive kill testdrone --purge      # or: hive prune, which sweeps every dead drone at once
 ```
 
 If `task` showed "attempt 2/3" — the drone was losing input, but the retry mechanism worked (OK).
@@ -146,6 +146,7 @@ Each of these points comes from a burnt drone or a hung coordinator. Do not "sim
 | `hive task` says the drone did not start | drone hanging on a dialog | `hive peek <drone>` |
 | drone `idle`, no report | considered the task done without writing | `hive say <drone> "write the report to <path>"` |
 | status `dead` | drone killed or crashed | `hive revive <drone>` — conversation history survives |
+| `dead` drones pile up in `status` | directories outlive the sessions | `hive prune --dry-run`, then `hive prune` |
 | `hive revive` loses history | herdr integration missing | `herdr integration status` → must say `claude: current` |
 | drones bypass the mailbox | old spawn without the system prompt | kill and spawn anew |
 

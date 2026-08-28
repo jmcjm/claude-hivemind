@@ -27,13 +27,17 @@ hive status [names]                swarm state table — NEVER blocks
 hive wait   [names] [--timeout S]  wait for reports, hard limit (default 300 s)
 hive report <name>                 a drone's report
 hive peek   <name> [lines]         view of the drone's terminal
-hive kill   <name> [--purge]       kill a drone (--purge also deletes reports)
+hive kill   <name> [--purge]       kill a drone; an already dead one is archived and removed
+                                   (--purge deletes without an archive)
+hive prune  [--purge] [--dry-run] [names]  clear out dead drones — archives them, then removes
 hive rename <old> <new>            rename a drone and its workspace
 hive revive <name>                 resurrection with full conversation history (--resume)
 hive sweep                         reconciliation pass — retry lost wake-ups, surface silent drones
 ```
 
 Swarm data: `~/.herdr-hive/drones/<name>/` → `meta.json`, `brief.md`, `report.md`.
+Archives of removed drones: `~/.herdr-hive/archive/<label>-<date>.tar.gz` (unpack with
+`tar xzf <archive> -C ~/.herdr-hive` to get a drone and its mailbox back).
 Model: `opus` (overridable via `HIVE_MODEL`).
 
 ## Architecture
@@ -238,10 +242,35 @@ that is long, resumable, and observable by the user.
 | `hive task` says "not delivered" | drone stuck on a dialog or unresponsive | `hive peek <drone>` |
 | status `blocked` | dialog despite skip-permissions | `hive peek`, answer via `herdr agent send-keys <drone> enter` |
 | status `dead` / missing panel | drone killed or crashed | `hive revive <drone>` — conversation history survives |
+| `dead` drones piling up in `status` | directories outlive the sessions | `hive prune --dry-run`, then `hive prune` |
 | drone `idle`, no report | considered the task done without writing | `hive say <drone> "write the report to <path>"` |
 | trust dialog on a new `--cwd` | folder untrusted in `~/.claude.json` | `hive spawn` handles it itself; if stubborn, `peek` + enter |
 | first-run dialog in swarm mode | first spawn on a fresh machine | `hive spawn` handles it itself, like the trust dialog |
 | swarm stands still, no mail at all | drone hook failed, or drone hung/died mid-turn | the sweep mails coord within ~5 min (`SWEEP: ...`); impatient? `hive sweep` by hand, then `hive peek` |
+
+## Corpses and cleanup
+
+A drone's directory outlives its session, so `hive status` keeps listing every drone that ever
+ran — with status `dead`. That is deliberate up to a point: `report.md` is evidence and `revive`
+needs `meta.json`. It stops being useful once hundreds of corpses bury the living swarm.
+
+- `hive prune --dry-run` — lists what would go, changes nothing. Run it first.
+- `hive prune` — for every drone whose status is `dead`: packs its directory **and mailbox** into
+  one tarball under `~/.herdr-hive/archive/`, then removes both. Prints the count and the archive
+  path. Drones that are `working`, `idle`, `blocked` or `unknown` are never touched — only `dead`.
+- `hive prune --purge` — the same, without the archive. Nothing to restore afterwards.
+- `hive prune <names...>` — restrict it to the drones you name (still dead-only).
+- `hive kill <dead-drone>` cleans up the same way instead of leaving a ghost behind: it archives
+  and removes. Killing a **living** drone still only closes the workspace and keeps the report,
+  because that report is usually the reason you are killing it.
+
+The sweep and prune are the two halves of the same job: the sweep **detects** — it mails
+`SWEEP: drone <name> is dead, task unfinished` and leaves the corpse alone; prune **removes** what
+you have already dealt with. So the order is: read the sweep's alert, decide (`hive revive` to
+carry the work on, or `hive kill` to conclude it), and only then `hive prune` to sweep the
+graveyard. A drone worth keeping should be revived, not pruned: `prune` cannot tell "finished"
+from "crashed" — both are `dead`, and the `.killed` marker that silences the sweep says nothing
+about whether the work succeeded.
 
 ## herdr technicalities (0.8.2)
 
