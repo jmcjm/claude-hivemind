@@ -163,6 +163,30 @@ as real failures. `hive gate` is a flock-backed exclusive window over `~/.herdr-
 Every brief that includes a full gate must carry: "full gates ONLY via hive gate enter/release;
 targeted test runs with a small filter need no slot."
 
+## Surviving a compaction
+
+The rules below are read once. When the conversation is compacted they are replaced by a summary
+written by a model that was never told which of them were load-bearing, and the coordinator drops
+back to default behaviour: work done inline, mail triage lost, waiting drones forgotten.
+
+Three files carry the discipline across that boundary, all installed by `install.sh` and all
+self-scoped to the registered coordinator session:
+
+| File | Hook | What it does |
+|---|---|---|
+| `coord-creed.md` | — | the eight rules, **the single source of truth**. The section below explains them; edit the discipline there, not here |
+| `coord-creed-inject.sh` | `SessionStart` (`compact\|resume\|clear\|fork`) | prints the creed back into the rebuilt context, followed by the board read from `$HIVE_DIR` at that moment: unread coordinator mail, drones with a task in flight and their live pane state, how crowded the swarm directory is |
+| `coord-compact-brief.sh` | `PreCompact` | tells the summarizer what must survive — who is spawned and what they were told, unanswered drone questions, decisions pending for the user |
+
+Two different things are lost at compaction, the **rules** and the **state**, and restoring only the
+first leaves the coordinator disciplined but blind. Hence the board: it is read from disk, so it is
+the one part of the injection that cannot be stale.
+
+`startup` is deliberately excluded — nothing is registered as coordinator that early, and injecting
+into every fresh session on the machine would leak swarm text into unrelated work. That case belongs
+to the `CLAUDE.md` section. `PostCompact` looks like the hook for this job and is not: its output
+goes to the user's terminal, never into the context.
+
 ## Iron rules
 
 1. **Never block forever.** No `herdr agent wait` or `herdr pane wait-output` without `--timeout` —
