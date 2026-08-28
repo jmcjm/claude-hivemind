@@ -28,14 +28,16 @@ esac
 
 echo "== 2/8 Skill files =="
 mkdir -p "$SKILL_DST"
-for f in hive drone-ping.sh coord-mail-check.sh drone-settings.json SKILL.md; do
+for f in hive drone-ping.sh coord-mail-check.sh coord-scope.sh coord-creed-inject.sh \
+         coord-compact-brief.sh coord-creed.md drone-settings.json SKILL.md; do
   if [ -e "$SKILL_DST/$f" ] && ! cmp -s "$SRC/skill/$f" "$SKILL_DST/$f"; then
     cp "$SKILL_DST/$f" "$SKILL_DST/$f.bak-$STAMP"
     warn "existing $f archived as $f.bak-$STAMP"
   fi
   cp "$SRC/skill/$f" "$SKILL_DST/$f"
 done
-chmod +x "$SKILL_DST/hive" "$SKILL_DST/drone-ping.sh" "$SKILL_DST/coord-mail-check.sh"
+chmod +x "$SKILL_DST/hive" "$SKILL_DST/drone-ping.sh" "$SKILL_DST/coord-mail-check.sh" \
+         "$SKILL_DST/coord-creed-inject.sh" "$SKILL_DST/coord-compact-brief.sh"
 ok "skill in $SKILL_DST"
 
 echo "== 3/8 hive in PATH =="
@@ -55,39 +57,52 @@ herdr integration status 2>/dev/null | grep -q '^claude: current' \
   && ok "claude integration active (settings.json backup: settings.json.bak-$STAMP)" \
   || die "claude integration does not report as active"
 
-echo "== 5/8 Coordinator Stop hook =="
-# The level-triggered backstop for lost wake-ups: the registered coordinator session
-# cannot end a turn while unread mail sits in mail/coord. The hook self-scopes to the
-# coord.pane session (drones and unrelated sessions exit instantly), so it is safe
-# to install into the user's global settings.
+echo "== 5/8 Coordinator hooks =="
+# Three hooks, all self-scoping to the registered coordinator session (drones and unrelated
+# sessions exit instantly), so they are safe to install into the user's global settings:
+#   Stop         - cannot end a turn while unread mail sits in mail/coord
+#   SessionStart - after a compaction, re-injects the creed and the board read from disk
+#   PreCompact   - tells the summarizer which coordination state must survive
 SETTINGS="$HOME/.claude/settings.json"
 [ -f "$SETTINGS" ] && cp "$SETTINGS" "$SETTINGS.bak-hook-$STAMP"
-HOOK_RESULT=$(python3 - "$SETTINGS" <<'PY'
+HOOK_RESULT=$(python3 - "$SETTINGS" <<'HOOKPY'
 import json, os, sys
 path = sys.argv[1]
-cmd = 'bash "$HOME/.claude/skills/hivemind/coord-mail-check.sh"'
+# The command uses $HOME rather than an expanded path: settings.json stays portable and the
+# skill is always installed under the user's home.
+def cmd(script):
+    return 'bash "$HOME/.claude/skills/hivemind/%s"' % script
+
+WANTED = [
+    ("Stop",         "*",                        cmd("coord-mail-check.sh"),    15),
+    ("SessionStart", "compact|resume|clear|fork", cmd("coord-creed-inject.sh"),  10),
+    ("PreCompact",   "auto|manual",              cmd("coord-compact-brief.sh"), 10),
+]
+
 data = {}
 if os.path.exists(path):
     with open(path) as f:
         data = json.load(f)
-stop = data.setdefault("hooks", {}).setdefault("Stop", [])
-present = any(h.get("command") == cmd
-              for grp in stop for h in grp.get("hooks", []))
-if present:
-    print("present")
-else:
-    stop.append({"matcher": "*",
-                 "hooks": [{"type": "command", "timeout": 15, "command": cmd}]})
+
+added, present = [], []
+hooks = data.setdefault("hooks", {})
+for event, matcher, command, timeout in WANTED:
+    entries = hooks.setdefault(event, [])
+    if any(h.get("command") == command for grp in entries for h in grp.get("hooks", [])):
+        present.append(event)
+        continue
+    entries.append({"matcher": matcher,
+                    "hooks": [{"type": "command", "timeout": timeout, "command": command}]})
+    added.append(event)
+
+if added:
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
         f.write("\n")
-    print("added")
-PY
+print("added: %s | already there: %s" % (", ".join(added) or "none", ", ".join(present) or "none"))
+HOOKPY
 ) || die "failed to update $SETTINGS (backup: $SETTINGS.bak-hook-$STAMP)"
-case "$HOOK_RESULT" in
-  added)   ok "Stop hook added to $SETTINGS (backup: settings.json.bak-hook-$STAMP)" ;;
-  present) ok "Stop hook already present — skipping" ;;
-esac
+ok "coordinator hooks - $HOOK_RESULT (backup: settings.json.bak-hook-$STAMP)"
 
 echo "== 6/8 Reconciliation sweep timer =="
 # The wake-up path is event-driven and every event can be lost; `hive sweep` is the
@@ -121,7 +136,10 @@ fi
 echo "== 8/8 Verification =="
 bash -n "$SKILL_DST/hive"                || die "hive: syntax error"
 bash -n "$SKILL_DST/drone-ping.sh"       || die "drone-ping.sh: syntax error"
-bash -n "$SKILL_DST/coord-mail-check.sh" || die "coord-mail-check.sh: syntax error"
+bash -n "$SKILL_DST/coord-mail-check.sh"    || die "coord-mail-check.sh: syntax error"
+bash -n "$SKILL_DST/coord-scope.sh"         || die "coord-scope.sh: syntax error"
+bash -n "$SKILL_DST/coord-creed-inject.sh"  || die "coord-creed-inject.sh: syntax error"
+bash -n "$SKILL_DST/coord-compact-brief.sh" || die "coord-compact-brief.sh: syntax error"
 python3 -c "import json;json.load(open('$SKILL_DST/drone-settings.json'))" || die "drone-settings.json: invalid JSON"
 "$SKILL_DST/hive" >/dev/null        || die "hive does not start"
 ok "syntax and JSON valid"
